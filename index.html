@@ -18,14 +18,25 @@
         <span>Hangout HQ</span>
       </a>
       <nav class="nav">
-        <a href="#/" data-nav="home">Hangouts</a>
-        <a href="#/friends" data-nav="friends">Friends</a>
-        <button class="btn btn-primary btn-sm" data-action="new-hangout">New hangout</button>
+        <a href="#/" data-nav="home" class="nav-link">Hangouts</a>
+        <a href="#/friends" data-nav="friends" class="nav-link">Friends</a>
+        <button class="btn btn-primary btn-sm" data-action="new-hangout"><span aria-hidden="true">+</span><span>New<span class="hide-sm"> hangout</span></span></button>
       </nav>
     </div>
   </header>
 
   <main id="app" class="wrap"></main>
+
+  <nav class="tabbar" aria-label="Sections">
+    <a href="#/" data-nav="home">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>
+      Hangouts
+    </a>
+    <a href="#/friends" data-nav="friends">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="9" r="3.5"/><path d="M2.5 20c.6-3.6 3.2-5.5 6.5-5.5s5.9 1.9 6.5 5.5"/><circle cx="17" cy="8" r="2.8"/><path d="M17 13.5c2.5 0 4.2 1.6 4.6 4.5"/></svg>
+      Friends
+    </a>
+  </nav>
 
   <dialog id="dialog" class="dialog"></dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>

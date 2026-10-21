@@ -103,7 +103,10 @@
       const raw = JSON.parse(localStorage.getItem(STORE_KEY));
       if (raw && Array.isArray(raw.hangouts) && Array.isArray(raw.friends)) return raw;
     } catch (_) { /* fall through to seed */ }
-    return seed();
+    // Save the seed right away so its ids (and links to them) survive a reload.
+    const fresh = seed();
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(fresh)); } catch (_) { /* storage unavailable */ }
+    return fresh;
   }
 
   let state = load();
@@ -346,7 +349,8 @@
       <a class="card" href="#/h/${esc(h.id)}">
         <div class="card-top">
           <div class="datebox ${d ? "" : "tbd"}">${d ? `<span>${d.toLocaleDateString(undefined, { month: "short" })}</span><b>${d.getDate()}</b>` : "<b>TBD</b>"}</div>
-          <div style="min-width:0;display:flex;flex-direction:column;gap:4px">
+          <div class="card-title">
+            ${sizePill(h.size)}
             <h3>${esc(h.title)}</h3>
             <div class="meta">${d ? `<span>${esc(fmtWhen(h))}</span>` : ""}${h.place ? `<span>${esc(h.place)}</span>` : ""}</div>
           </div>
@@ -354,9 +358,8 @@
         <div class="card-foot">
           <div class="row" style="gap:10px">
             <div class="avatars">${shown.map((g) => avatar(g.friendId)).join("")}${going.length > 5 ? `<span class="avatar more">+${going.length - 5}</span>` : ""}</div>
-            <span class="muted small">${going.length} going${openTasks ? ` · ${openTasks} to-do${openTasks > 1 ? "s" : ""}` : ""}</span>
+            <span class="muted small">${going.length} going${openTasks ? ` · ${openTasks} to-do${openTasks > 1 ? "s" : ""} left` : ""}</span>
           </div>
-          ${sizePill(h.size)}
         </div>
       </a>`;
   }
@@ -372,11 +375,11 @@
     const missing = Object.keys(MODULES).filter((m) => !has(m));
 
     const stats = [
-      `<div class="stat"><span>Going</span><b>${counts.going}<span class="muted small" style="text-transform:none;letter-spacing:0"> of ${h.guests.length} invited</span></b></div>`,
+      `<div class="stat"><span>Going</span><b>${counts.going}<small> of ${h.guests.length}</small></b></div>`,
       n !== null && n >= 0 ? `<div class="stat"><span>Countdown</span><b>${n === 0 ? "Today" : n === 1 ? "Tomorrow" : `${n} days`}</b></div>` : "",
       has("tasks") && h.tasks.length ? `<div class="stat"><span>To-dos done</span><b>${tasksDone}/${h.tasks.length}</b><div class="bar"><i style="width:${(tasksDone / h.tasks.length) * 100}%"></i></div></div>` : "",
       has("bring") && h.bring.length ? `<div class="stat"><span>Items covered</span><b>${bringCovered}/${h.bring.length}</b><div class="bar"><i style="width:${(bringCovered / h.bring.length) * 100}%"></i></div></div>` : "",
-      has("budget") && (spent || h.budget) ? `<div class="stat"><span>Spent${h.budget ? " of budget" : ""}</span><b>${money(spent)}${h.budget ? `<span class="muted small"> / ${money(h.budget)}</span>` : ""}</b>${h.budget ? `<div class="bar"><i style="width:${Math.min(100, (spent / h.budget) * 100)}%;${spent > h.budget ? "background:var(--bad)" : ""}"></i></div>` : ""}</div>` : "",
+      has("budget") && (spent || h.budget) ? `<div class="stat"><span>Spent</span><b>${money(spent)}${h.budget ? `<small> / ${money(h.budget)}</small>` : ""}</b>${h.budget ? `<div class="bar"><i style="width:${Math.min(100, (spent / h.budget) * 100)}%;${spent > h.budget ? "background:var(--bad)" : ""}"></i></div>` : ""}</div>` : "",
     ].join("");
 
     const order = ["guests", "tasks", "bring", "schedule", "budget", "poll", "notes"];
@@ -389,7 +392,7 @@
             <h1>${esc(h.title)}</h1>
           </div>
           <div class="hero-actions">
-            <button class="btn btn-sm" data-action="edit-hangout">Edit details</button>
+            <button class="btn btn-sm" data-action="edit-hangout">Edit</button>
             <button class="btn btn-sm" data-action="copy-invite">Copy invite</button>
             <button class="btn btn-sm" data-action="share-link">Share link</button>
             <button class="btn btn-sm btn-ghost" data-action="duplicate">Duplicate</button>
@@ -440,12 +443,12 @@
             </span>
             <button class="icon-btn" data-action="remove-guest" aria-label="Remove ${esc(fname(g.friendId))}">×</button>
           </li>`).join("")}</ul>` : `<p class="muted small">No one invited yet.</p>`}
-        <form class="add-row" data-form="add-guest">
+        <form class="add-row add-row-inline" data-form="add-guest">
           <input class="input" name="name" list="friend-names" placeholder="Invite someone by name" autocomplete="off" aria-label="Name to invite">
-          <datalist id="friend-names">${notInvited.map((f) => `<option value="${esc(f.name)}"></option>`).join("")}</datalist>
           <button class="btn btn-sm">Invite</button>
           ${notInvited.length ? `<button type="button" class="btn btn-sm btn-ghost" data-action="invite-all">Invite all friends</button>` : ""}
-        </form>`, { sub: `${h.guests.filter((g) => g.rsvp === "going").length} going` });
+        </form>
+        <datalist id="friend-names">${notInvited.map((f) => `<option value="${esc(f.name)}"></option>`).join("")}</datalist>`, { sub: `${h.guests.filter((g) => g.rsvp === "going").length} going` });
     }
     if (m === "bring" || m === "tasks") {
       const items = h[m];
@@ -453,8 +456,8 @@
         ${items.length ? `<ul class="list">${items.map((t) => `
           <li data-id="${esc(t.id)}" class="${t.done ? "done" : ""}">
             <input type="checkbox" class="check" data-action="toggle-item" data-list="${m}" ${t.done ? "checked" : ""} aria-label="Mark done">
-            <span class="grow">${esc(t.text)}</span>
-            ${friendSelect("assign", t.friendId, { blank: m === "bring" ? "Needs someone" : "Unassigned" })}
+            <span class="item-body"><span class="grow">${esc(t.text)}</span>
+            ${friendSelect("assign", t.friendId, { blank: m === "bring" ? "Needs someone" : "Unassigned" })}</span>
             <button class="icon-btn" data-action="remove-item" data-list="${m}" aria-label="Remove">×</button>
           </li>`).join("")}</ul>` : `<p class="muted small">${m === "bring" ? "List snacks, gear or anything people should bring." : "Bookings, shopping, anything that has to get done."}</p>`}
         <form class="add-row" data-form="add-item" data-list="${m}">
@@ -470,8 +473,8 @@
           <li data-id="${esc(s.id)}"><span class="time">${esc(s.time ? fmtTime(s.time) : "—")}</span><span class="grow">${esc(s.text)}</span>
           <button class="icon-btn" data-action="remove-schedule" aria-label="Remove">×</button></li>`).join("")}</ul>` : `<p class="muted small">Lay out the run of the day or night.</p>`}
         <form class="add-row" data-form="add-schedule">
-          <input class="input amount" type="time" name="time" aria-label="Time">
           <input class="input" name="text" placeholder="What happens" aria-label="What happens" required>
+          <input class="input amount" type="time" name="time" aria-label="Time">
           <button class="btn btn-sm">Add</button>
         </form>`);
     }
@@ -481,10 +484,11 @@
       const spent = h.expenses.reduce((s, e) => s + e.amount, 0);
       const splitDefault = guestIds.length ? h.guests.filter((g) => g.rsvp === "going").map((g) => g.friendId) : [];
       return moduleShell(m, h, `
-        <div class="row"><label class="field" style="flex:0 1 180px"><span>Budget</span>
-          <input class="input" type="number" min="0" step="0.01" inputmode="decimal" data-field="budget" value="${h.budget || ""}" placeholder="Optional"></label>
-          <div class="field"><span>Spent</span><b class="money">${money(spent)}</b></div>
-          <div class="field"><span>Currency</span><input class="input" style="width:70px" data-field="currency" value="${esc(state.currency)}" maxlength="4" aria-label="Currency symbol"></div>
+        <div class="budget-grid">
+          <label class="field"><span>Budget</span>
+            <input class="input" type="number" min="0" step="0.01" inputmode="decimal" data-field="budget" value="${h.budget || ""}" placeholder="Optional"></label>
+          <label class="field"><span>Currency</span><input class="input" data-field="currency" value="${esc(state.currency)}" maxlength="4"></label>
+          <div class="field"><span>Spent</span><b class="money spent-val">${money(spent)}</b></div>
         </div>
         ${h.expenses.length ? `<ul class="list">${h.expenses.map((e) => `
           <li data-id="${esc(e.id)}"><span class="grow"><b>${esc(e.text)}</b><br><span class="muted small">${esc(fname(e.paidBy))} paid · split ${e.split.length} way${e.split.length === 1 ? "" : "s"}</span></span>
@@ -546,9 +550,9 @@
       <div class="friend-list">
         ${sorted.map((f) => `
           <div class="friend" data-id="${esc(f.id)}">${avatar(f.id)}
-            <div class="grow"><b>${esc(f.name)}${f.id === state.meId ? ' <span class="muted small">(you)</span>' : ""}</b><span class="muted small">${counts[f.id] || 0} hangout${counts[f.id] === 1 ? "" : "s"}</span></div>
+            <div class="grow"><b>${esc(f.name)}${f.id === state.meId && f.name.toLowerCase() !== "you" ? ' <span class="muted small">(you)</span>' : ""}</b><span class="muted small">${counts[f.id] || 0} hangout${counts[f.id] === 1 ? "" : "s"}</span></div>
             <button class="btn btn-sm btn-ghost" data-action="rename-friend">Rename</button>
-            ${f.id !== state.meId ? `<button class="icon-btn" data-action="remove-friend" aria-label="Remove ${esc(f.name)}">×</button>` : ""}
+            ${f.id !== state.meId ? `<button class="icon-btn" data-action="remove-friend" aria-label="Remove ${esc(f.name)}">×</button>` : '<span class="icon-btn" aria-hidden="true"></span>'}
           </div>`).join("")}
       </div>
       <section class="panel">
@@ -568,6 +572,8 @@
   let pendingImport = null;
 
   function route() {
+    const dlg = $("#dialog");
+    if (dlg.open) dlg.close();
     const hash = location.hash || "#/";
     if (hash.startsWith("#/import/")) {
       pendingImport = decodeShare(hash.slice(9));
@@ -630,9 +636,9 @@
           </div>
           ${isNew ? `<small class="muted">This picks which planning tools you start with. You can add or hide any of them later.</small>` : ""}
         </div>
-        <div class="grid-2">
+        <div class="when-grid">
           <label class="field"><span>Date</span><input class="input" id="f-date" type="date" name="date" value="${esc(v.date)}"></label>
-          <div class="grid-2" style="gap:8px">
+          <div class="time-pair">
             <label class="field"><span>Starts</span><input class="input" id="f-time" type="time" name="time" value="${esc(v.time)}"></label>
             <label class="field"><span>Ends</span><input class="input" id="f-end" type="time" name="endTime" value="${esc(v.endTime)}"></label>
           </div>
