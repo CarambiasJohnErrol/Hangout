@@ -8,16 +8,18 @@ The size decides which planning tools you start with, and you can add or hide an
 - **Guests** with Going / Maybe / Can't RSVPs
 - **Who's bringing what**, with an owner for each item
 - **To-dos** with assignees and progress
-- **Costs**: list what things cost and who shares each one, with a per-person total for the
-  whole hangout. Nobody has to have paid yet
-- **Split the bill**: mark who paid for each cost and see who pays whom to settle up
+- **Costs**: what each person pays (a ticket, an entrance fee), added up into one per-person
+  total for the whole hangout, plus the group total
+- **Split the bill**: bills one person paid for the group, split evenly between everyone,
+  with who pays whom to settle up
 - **Schedule** for the run of the day
 - **Group vote** for picking a date, place or food
 - **Notes**
 - **Pictures**: a profile photo for you, and a cover photo for each hangout
 
-Share a hangout by copying a ready-to-paste invite for the group chat, or a link that lets a
-friend add the whole plan to their own Hangout HQ.
+Share a hangout by copying a ready-to-paste invite for the group chat, or a short link
+(`…/#/s/<id>`) that lets a friend add the whole plan to their own Hangout HQ. The shared copy is
+kept at `shares/<id>` and updates whenever you change the hangout.
 
 ## Running it
 

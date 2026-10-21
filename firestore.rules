@@ -1,8 +1,10 @@
 rules_version = '2';
 
-// Each account's hangouts live in one document, users/<their uid>, and each
-// photo in users/<their uid>/photos/<photo id>.
-// Only the signed-in owner can read or write any of it.
+// users/<uid>                 one account's hangouts (owner only)
+// users/<uid>/photos/<id>     that account's profile and cover pictures (owner only)
+// shares/<id>                 a shared copy of one hangout, behind a short link:
+//                             any signed-in user with the link can read it,
+//                             only the person who shared it can change it
 service cloud.firestore {
   match /databases/{database}/documents {
     match /users/{uid} {
@@ -14,6 +16,14 @@ service cloud.firestore {
           && request.resource.data.data is string
           && request.resource.data.data.size() < 1000000;
       }
+    }
+
+    match /shares/{shareId} {
+      allow get: if request.auth != null;
+      allow create: if request.auth != null && request.resource.data.createdBy == request.auth.uid;
+      allow update: if request.auth != null && resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdBy == request.auth.uid;
+      allow delete: if request.auth != null && resource.data.createdBy == request.auth.uid;
     }
   }
 }
