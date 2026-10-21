@@ -8,8 +8,8 @@
   const COLORS = ["#2f5bea", "#e2557a", "#1f8a5b", "#b8650a", "#7b4fd6", "#0f8a9c", "#c53c3c", "#5b6b2f"];
 
   const SIZES = [
-    { id: 1, label: "Quick hang", hint: "2–5 people, barely any planning", modules: ["guests", "ideas", "notes"] },
-    { id: 2, label: "Get-together", hint: "5–12 people, a few things to sort", modules: ["guests", "bring", "poll", "ideas", "notes"] },
+    { id: 1, label: "Quick hang", hint: "2–5 people, barely any planning", modules: ["guests", "recs", "ideas", "notes"] },
+    { id: 2, label: "Get-together", hint: "5–12 people, a few things to sort", modules: ["guests", "bring", "poll", "recs", "ideas", "notes"] },
     { id: 3, label: "Party", hint: "10–30 people, tasks and costs", modules: ["guests", "bring", "tasks", "budget", "split", "schedule", "notes"] },
     { id: 4, label: "Big event", hint: "30+ people, trips, milestones", modules: ["guests", "tasks", "budget", "split", "schedule", "bring", "poll", "notes"] },
   ];
@@ -22,6 +22,7 @@
     split: "Split the bill",
     schedule: "Schedule",
     poll: "Group vote",
+    recs: "Recommendations",
     ideas: "Ideas nearby",
     notes: "Notes",
   };
@@ -414,6 +415,7 @@
     if ((!s.currency || s.currency === "$") && !s.currencyChosen) { s.currency = DEFAULT_CURRENCY; changed = true; }
     s.hangouts.forEach((h) => {
       if (!Array.isArray(h.costs)) { h.costs = []; changed = true; }
+      if (!Array.isArray(h.recs)) { h.recs = []; changed = true; }
       // Bills used to be split between whoever was going when they were added, which went
       // stale as people answered. They now split between everyone, kept up to date.
       h.expenses.forEach((e) => { if (e.everyone === undefined) { e.everyone = true; changed = true; } });
@@ -915,6 +917,79 @@
   let settleMode = "bill"; // "bill" | "fewest"
   try { if (localStorage.getItem("hangout-hq-settle") === "fewest") settleMode = "fewest"; } catch (_) { /* default */ }
 
+  // ---------- recommendations & group ratings ----------
+  // A hangout's recommended places live in h.recs (added by the owner and editors).
+  // Everyone rates them 1-5 stars. Owner and local ratings sit on the place itself
+  // (rec.ratings, keyed by account); people who joined a shared hangout keep theirs
+  // in their own member entry (members.<uid>.ratings.<rec id>), which the rules let
+  // even view-only guests write.
+
+  const raterKey = () => user?.uid || "me";
+  const validStars = (v) => Number.isInteger(Number(v)) && Number(v) >= 1 && Number(v) <= 5;
+
+  function recRatings(h, rec) {
+    const all = { ...(rec.ratings || {}) };
+    Object.entries(metaOf(h)?.members || {}).forEach(([m, info]) => {
+      const v = info.ratings?.[rec.id];
+      if (v) all[m] = v;
+    });
+    return Object.values(all).map(Number).filter(validStars);
+  }
+  function myRating(h, rec) {
+    if (isJoined(h)) return Number(metaOf(h)?.members?.[user.uid]?.ratings?.[rec.id]) || 0;
+    return Number(rec.ratings?.[raterKey()]) || 0;
+  }
+  function ratingSummary(h, rec) {
+    const list = recRatings(h, rec);
+    return { avg: list.length ? list.reduce((a, b) => a + b, 0) / list.length : 0, count: list.length };
+  }
+  const sortRecs = (h) => [...(h.recs || [])].map((r) => ({ r, ...ratingSummary(h, r) }))
+    .sort((a, b) => b.avg - a.avg || b.count - a.count || (a.r.addedAt || 0) - (b.r.addedAt || 0));
+
+  function rateRec(h, rec, stars) {
+    const next = myRating(h, rec) === stars ? 0 : stars; // tapping your rating again clears it
+    if (isJoined(h)) {
+      const me = metaOf(h)?.members?.[user.uid];
+      if (!me) return;
+      me.ratings = { ...(me.ratings || {}) };
+      if (next) me.ratings[rec.id] = next; else delete me.ratings[rec.id];
+      shareRef(h._shareId).update({ [`members.${user.uid}.ratings.${rec.id}`]: next ? next : FV().delete() })
+        .catch(() => toast("Couldn't save your rating. Check your connection"));
+      render();
+      return;
+    }
+    rec.ratings = { ...(rec.ratings || {}) };
+    if (next) rec.ratings[raterKey()] = next; else delete rec.ratings[raterKey()];
+    commit();
+  }
+
+  // Your groups' ratings across every hangout, by OpenStreetMap place, for Ideas nearby.
+  function groupRatingIndex() {
+    const index = new Map();
+    [...(state?.hangouts || []), ...joinedHangouts].forEach((h) => (h.recs || []).forEach((rec) => {
+      if (!rec.osm) return;
+      const list = recRatings(h, rec);
+      if (!list.length) return;
+      const cur = index.get(rec.osm) || { sum: 0, count: 0 };
+      index.set(rec.osm, { sum: cur.sum + list.reduce((a, b) => a + b, 0), count: cur.count + list.length });
+    }));
+    return index;
+  }
+  const starsText = (avg, count) => (count ? `★ ${avg.toFixed(1)} <span class="muted">(${count})</span>` : "");
+
+  function recommendPlace(h, place) {
+    h.recs = h.recs || [];
+    if (h.recs.some((r) => (place.osm && r.osm === place.osm) || r.name.toLowerCase() === place.name.toLowerCase())) {
+      toast(`${place.name} is already recommended`);
+      return;
+    }
+    const { osm, name, kind, cuisine, lat, lon } = place;
+    h.recs.push({ id: uid(), osm: osm || "", name, kind, cuisine: cuisine || "", lat, lon, addedBy: myName(), addedAt: Date.now(), ratings: {} });
+    if (!h.modules.includes("recs")) h.modules.splice(Math.max(0, h.modules.indexOf("ideas")), 0, "recs");
+    commit();
+    toast(`Recommended ${name}. Everyone in the hangout can see and rate it`);
+  }
+
   // ---------- ideas nearby ----------
   // Places come from OpenStreetMap through Nominatim (free, no key). Its usage policy
   // allows at most one request a second, so searches run one category at a time and
@@ -979,7 +1054,7 @@
   }
 
   function ideaState(key) {
-    if (!ideas.has(key)) ideas.set(key, { status: "idle", cat: "all", radius: 3000, places: new Map(), loaded: new Set(), failedQ: new Set(), pending: 0, failed: 0, gen: 0, show: 30 });
+    if (!ideas.has(key)) ideas.set(key, { status: "idle", cat: "all", radius: 3000, places: new Map(), loaded: new Set(), failedQ: new Set(), pending: 0, failed: 0, gen: 0, show: 30, sort: "near" });
     return ideas.get(key);
   }
 
@@ -1013,7 +1088,8 @@
           const dist = distanceM(st.from, at);
           if (dist > st.radius * 1.05) return;
           const cuisine = x.extratags?.cuisine ? titleCase(x.extratags.cuisine.split(";")[0]) : "";
-          st.places.set(`${x.osm_type}${x.osm_id}`, { name: x.name, cat: kind[0], kind: kind[1], cuisine, dist, ...at });
+          const osm = `${x.osm_type}${x.osm_id}`;
+          st.places.set(osm, { osm, name: x.name, cat: kind[0], kind: kind[1], cuisine, dist, ...at });
         });
       }).catch(() => { if (st.gen === gen) { st.failed++; st.failedQ.add(q); } })
         .finally(() => {
@@ -1094,7 +1170,11 @@
     if (st.status === "error" && !st.places.size) {
       return `<div class="banner">${esc(st.error)}</div>${start}`;
     }
-    const all = [...st.places.values()].sort((a, b) => a.dist - b.dist);
+    const rated = groupRatingIndex();
+    const scoreOf = (p) => { const r = rated.get(p.osm); return r ? r.sum / r.count : 0; };
+    const all = [...st.places.values()].sort(st.sort === "rated"
+      ? (a, b) => scoreOf(b) - scoreOf(a) || (rated.get(b.osm)?.count || 0) - (rated.get(a.osm)?.count || 0) || a.dist - b.dist
+      : (a, b) => a.dist - b.dist);
     const shown = st.cat === "all" ? all : all.filter((p) => p.cat === st.cat);
     st.view = shown.slice(0, st.show);
     const where = st.from.label === "you" ? "you" : esc(st.from.label);
@@ -1104,13 +1184,18 @@
         <button class="btn btn-sm btn-ghost" data-action="ideas-reset">Change</button>
       </div>
       <div class="chips ideas-radius" role="group" aria-label="Distance">${[1000, 3000, 10000].map((r) => `<button class="chip" data-action="ideas-radius" data-v="${r}" aria-pressed="${st.radius === r}">${r / 1000} km</button>`).join("")}</div>
+      <div class="chips ideas-sort" role="group" aria-label="Sort">
+        <button class="chip" data-action="ideas-sort" data-v="near" aria-pressed="${st.sort !== "rated"}">Nearest</button>
+        <button class="chip" data-action="ideas-sort" data-v="rated" aria-pressed="${st.sort === "rated"}">Top rated</button>
+      </div>
+      ${st.sort === "rated" && !rated.size ? `<p class="muted small">No ratings yet. Recommend places to a hangout and rate them, and they'll rise to the top here.</p>` : ""}
       <div class="chips ideas-cats" role="group" aria-label="Kind of place">${IDEA_CATS.map(([c, l]) => `<button class="chip" data-action="ideas-cat" data-v="${c}" aria-pressed="${st.cat === c}">${l}</button>`).join("")}</div>
       ${st.view.length ? `<ul class="list ideas-list">${st.view.map((p, i) => `
         <li class="idea">
-          <span class="grow"><b>${esc(p.name)}</b><span class="muted small">${esc(p.kind)}${p.cuisine && p.cuisine !== p.kind ? ` · ${esc(p.cuisine)}` : ""} · ${fmtDistance(p.dist)}</span></span>
+          <span class="grow"><b>${esc(p.name)}</b><span class="muted small">${rated.get(p.osm) ? `<span class="stars-avg">${starsText(rated.get(p.osm).sum / rated.get(p.osm).count, rated.get(p.osm).count)}</span> · ` : ""}${esc(p.kind)}${p.cuisine && p.cuisine !== p.kind ? ` · ${esc(p.cuisine)}` : ""} · ${fmtDistance(p.dist)}</span></span>
           <span class="idea-actions">
             <a class="btn btn-sm btn-ghost" href="https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lon}" target="_blank" rel="noopener">Map</a>
-            ${h && edit ? `<button class="btn btn-sm" data-action="idea-vote" data-i="${i}">+ Vote</button><button class="btn btn-sm" data-action="idea-use" data-i="${i}">Use as place</button>` : ""}
+            ${h && edit ? ((h.recs || []).some((r) => r.osm === p.osm) ? `<span class="tag">Recommended</span>` : `<button class="btn btn-sm btn-primary" data-action="idea-recommend" data-i="${i}">Recommend</button>`) : ""}
             ${!h ? `<button class="btn btn-sm btn-primary" data-action="idea-plan" data-i="${i}">Plan here</button>` : ""}
           </span>
         </li>`).join("")}</ul>`
@@ -1242,7 +1327,7 @@
       has("budget") && (group || h.budget) ? `<div class="stat"><span>Group total</span><b>${money(group)}${h.budget ? `<small> / ${money(h.budget)}</small>` : ""}</b>${h.budget ? `<div class="bar"><i style="width:${Math.min(100, (group / h.budget) * 100)}%;${group > h.budget ? "background:var(--bad)" : ""}"></i></div>` : ""}</div>` : "",
     ].join("");
 
-    const order = ["guests", "tasks", "bring", "schedule", "budget", "split", "poll", "ideas", "notes"];
+    const order = ["guests", "tasks", "bring", "schedule", "budget", "split", "poll", "recs", "ideas", "notes"];
     const meta = metaOf(h);
     const sharedNote = isJoined(h)
       ? `<div class="share-note"><span>Shared by <b>${esc(meta?.ownerName || "a friend")}</b> · ${role === "editor" ? "You can edit" : "View only"}</span><button class="btn btn-sm btn-ghost btn-danger" data-action="leave-hangout">Leave</button></div>`
@@ -1489,6 +1574,30 @@
           </div>`).join("")}</div>
         <form class="add-row" data-form="add-option"><input class="input" name="text" placeholder="Add an option" aria-label="Add an option" required><button class="btn btn-sm">Add</button></form>
         <p class="muted small">Tap a name under an option to record their vote.</p>`);
+    }
+    if (m === "recs") {
+      const list = sortRecs(h);
+      const edit = canEdit(h);
+      return moduleShell(m, h, list.length ? `<ul class="list recs-list">${list.map(({ r, avg, count }) => {
+        const mine = myRating(h, r);
+        return `<li class="rec" data-id="${esc(r.id)}">
+          <span class="grow">
+            <b>${esc(r.name)}</b>
+            <span class="muted small">${count ? `<span class="stars-avg">${starsText(avg, count)}</span> · ` : ""}${esc(r.kind || "Place")}${r.cuisine && r.cuisine !== r.kind ? ` · ${esc(r.cuisine)}` : ""}${r.addedBy ? ` · added by ${esc(r.addedBy)}` : ""}</span>
+            <span class="rate" role="group" aria-label="Your rating for ${esc(r.name)}">
+              ${[1, 2, 3, 4, 5].map((n) => `<button class="star" data-action="rate-rec" data-v="${n}" aria-pressed="${n <= mine}" aria-label="${n} star${n > 1 ? "s" : ""}">★</button>`).join("")}
+              <span class="muted small">${mine ? "Your rating" : "Rate it"}</span>
+            </span>
+          </span>
+          <span class="idea-actions">
+            ${r.lat ? `<a class="btn btn-sm btn-ghost" href="https://www.google.com/maps/search/?api=1&query=${r.lat},${r.lon}" target="_blank" rel="noopener">Map</a>` : ""}
+            ${edit ? `<button class="btn btn-sm" data-action="rec-vote">+ Vote</button><button class="btn btn-sm" data-action="rec-use">Use as place</button>
+            <button class="icon-btn" data-action="remove-rec" aria-label="Remove ${esc(r.name)}">×</button>` : ""}
+          </span>
+        </li>`;
+      }).join("")}</ul>`
+        : `<p class="muted small">${edit ? "No recommendations yet. Find places in Ideas nearby and tap Recommend. Everyone in the hangout can see and rate them." : "No recommendations yet. The host can add some from Ideas nearby."}</p>`,
+      { wide: true, sub: list.length ? `${list.length} place${list.length > 1 ? "s" : ""} · best rated first` : "" });
     }
     if (m === "ideas") {
       return moduleShell(m, h, `<div class="ideas" data-ideas="${esc(h.id)}">${ideasBody(h.id)}</div>`, { wide: true });
@@ -1924,7 +2033,7 @@
     const li = btn.closest("[data-id]");
     const id = li?.dataset.id;
 
-    const PLAN_ACTIONS = ["idea-use", "idea-vote", "edit-hangout", "remove-cover", "invite-all", "toggle-item", "remove-item", "remove-schedule",
+    const PLAN_ACTIONS = ["idea-recommend", "rec-vote", "rec-use", "remove-rec", "edit-hangout", "remove-cover", "invite-all", "toggle-item", "remove-item", "remove-schedule",
       "remove-expense", "remove-cost", "vote", "reset-poll", "add-module", "remove-module", "delete-hangout", "duplicate"];
     if (h && PLAN_ACTIONS.includes(action)) {
       if (!canEdit(h)) { toast("You can view this hangout. Ask the host if you want to edit it"); e.preventDefault(); render(); return; }
@@ -1949,7 +2058,7 @@
       case "remove-profile-pic": removeProfilePicture(); break;
       case "new-hangout": openHangoutDialog(null); break;
       case "ideas-me": case "ideas-place": case "ideas-reset": case "ideas-radius": case "ideas-cat":
-      case "ideas-more": case "ideas-retry": case "idea-use": case "idea-vote": case "idea-plan": {
+      case "ideas-more": case "ideas-retry": case "ideas-sort": case "idea-recommend": case "idea-plan": {
         const key = btn.closest("[data-ideas]")?.dataset.ideas;
         if (!key) break;
         const st = ideaState(key);
@@ -1961,14 +2070,24 @@
         else if (action === "ideas-cat") { st.cat = btn.dataset.v; st.show = 30; queueIdeas(key); }
         else if (action === "ideas-more") { st.show += 30; refreshIdeas(key); }
         else if (action === "ideas-retry") { st.failedQ.forEach((q) => st.loaded.delete(q)); st.failedQ.clear(); st.failed = 0; queueIdeas(key); }
-        else if (action === "idea-use" && place && h) { h.place = place.name; commit(); toast(`Place set to ${place.name}`); }
-        else if (action === "idea-vote" && place && h) {
+        else if (action === "ideas-sort") { st.sort = btn.dataset.v; refreshIdeas(key); }
+        else if (action === "idea-recommend" && place && h) recommendPlace(h, place);
+        else if (action === "idea-plan" && place) openHangoutDialog(null, { title: `Hangout at ${place.name}`, place: place.name });
+        break;
+      }
+      case "rate-rec": case "rec-vote": case "rec-use": case "remove-rec": {
+        const rec = (h?.recs || []).find((r) => r.id === id);
+        if (!rec) break;
+        if (action === "rate-rec") rateRec(h, rec, Number(btn.dataset.v));
+        else if (action === "rec-use") { h.place = rec.name; commit(); toast(`Place set to ${rec.name}`); }
+        else if (action === "remove-rec") { h.recs = h.recs.filter((r) => r.id !== rec.id); commit(); toast(`Removed ${rec.name}`); }
+        else {
           if (!h.poll) h.poll = { question: "Where should we go?", options: [] };
-          if (h.poll.options.some((o) => o.text.toLowerCase() === place.name.toLowerCase())) { toast(`${place.name} is already in the vote`); break; }
-          h.poll.options.push({ id: uid(), text: place.name, votes: [] });
+          if (h.poll.options.some((o) => o.text.toLowerCase() === rec.name.toLowerCase())) { toast(`${rec.name} is already in the vote`); break; }
+          h.poll.options.push({ id: uid(), text: rec.name, votes: [] });
           if (!h.modules.includes("poll")) h.modules.push("poll");
-          commit(); toast(`Added ${place.name} to the group vote`);
-        } else if (action === "idea-plan" && place) openHangoutDialog(null, { title: `Hangout at ${place.name}`, place: place.name });
+          commit(); toast(`Added ${rec.name} to the group vote`);
+        }
         break;
       }
       case "edit-hangout": openHangoutDialog(h); break;

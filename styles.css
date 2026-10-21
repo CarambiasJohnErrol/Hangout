@@ -736,3 +736,23 @@ button.tag.perm[aria-pressed="true"] { background: var(--good-soft); color: var(
   .idea-actions .btn { min-height: 36px; }
 }
 a.btn { text-decoration: none; }
+
+/* ---------- Recommendations & ratings ---------- */
+.rec { align-items: flex-start; flex-wrap: wrap; }
+.rec .grow { display: flex; flex-direction: column; gap: 3px; min-width: 180px; }
+.stars-avg { color: var(--sun); font-weight: 700; }
+.stars-avg .muted { font-weight: 500; }
+.rate { display: inline-flex; align-items: center; gap: 2px; margin-top: 2px; }
+.rate .muted { margin-left: 6px; }
+.star {
+  border: 0; background: transparent; padding: 2px 3px; font-size: 1.25rem; line-height: 1; cursor: pointer;
+  color: var(--line); transition: transform .1s;
+}
+.star[aria-pressed="true"] { color: var(--sun); }
+.star:hover { transform: scale(1.15); }
+.ideas-sort .chip { flex: none; }
+@media (max-width: 640px) {
+  .rec .grow { flex-basis: 100%; }
+  .star { font-size: 1.5rem; padding: 3px 4px; }
+}
+@media (prefers-reduced-motion: reduce) { .star { transition: none; } }

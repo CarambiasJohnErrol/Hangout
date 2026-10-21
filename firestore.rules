@@ -4,7 +4,7 @@ rules_version = '2';
 // users/<uid>/photos/<id>   that account's profile and cover pictures (owner only)
 // shares/<id>               a shared hangout behind an invite link:
 //   - any signed-in person with the link can read it and join as a viewer
-//   - each member can change only their own entry (name, RSVP), never their role
+//   - each member can change only their own entry (name, RSVP, star ratings), never their role
 //   - editors (listed in `editors`) can change the plan, not members or roles
 //   - only the owner (`createdBy`) can change roles, remove people, or delete it
 service cloud.firestore {
@@ -48,8 +48,10 @@ service cloud.firestore {
         && (
           !(me() in newMembers())
           || (
-            newMembers()[me()].keys().hasOnly(['name', 'rsvp', 'role', 'joinedAt'])
+            newMembers()[me()].keys().hasOnly(['name', 'rsvp', 'role', 'joinedAt', 'ratings'])
             && newMembers()[me()].rsvp in ['pending', 'going', 'maybe', 'no']
+            && newMembers()[me()].get('ratings', {}) is map
+            && newMembers()[me()].get('ratings', {}).size() <= 200
             && newMembers()[me()].role == oldMembers().get(me(), {'role': 'viewer'}).get('role', 'viewer')
           )
         );
