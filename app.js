@@ -68,9 +68,9 @@
         { id: uid(), text: "Buy decorations", friendId: you, done: false },
       ],
       expenses: [
-        { id: uid(), text: "Cake", amount: 1800, paidBy: mika, split: [you, mika, jo, andre] },
-        { id: uid(), text: "Rooftop deposit", amount: 3000, paidBy: andre, split: [you, mika, jo, andre] },
-        { id: uid(), text: "Decorations", amount: 900, paidBy: you, split: [you, mika, jo, andre] },
+        { id: uid(), text: "Cake", amount: 1800, paidBy: mika, everyone: true, split: [] },
+        { id: uid(), text: "Rooftop deposit", amount: 3000, paidBy: andre, everyone: true, split: [] },
+        { id: uid(), text: "Decorations", amount: 900, paidBy: you, everyone: true, split: [] },
       ],
       costs: [
         { id: uid(), text: "Rooftop entry", amount: 300 },
@@ -413,6 +413,9 @@
     if ((!s.currency || s.currency === "$") && !s.currencyChosen) { s.currency = DEFAULT_CURRENCY; changed = true; }
     s.hangouts.forEach((h) => {
       if (!Array.isArray(h.costs)) { h.costs = []; changed = true; }
+      // Bills used to be split between whoever was going when they were added, which went
+      // stale as people answered. They now split between everyone, kept up to date.
+      h.expenses.forEach((e) => { if (e.everyone === undefined) { e.everyone = true; changed = true; } });
       // Costs became per-person amounts; the earlier shared costs now live under Split the bill.
       if (h.modules.includes("budget") && !h.modules.includes("split") && h.expenses.length) {
         h.modules.splice(h.modules.indexOf("budget") + 1, 0, "split");
@@ -821,14 +824,28 @@
   const groupTotal = (h) => perPerson(h) * headcount(h);
   const billsTotal = (h) => h.expenses.reduce((s, e) => s + (Number(e.amount) || 0), 0);
 
+  // "Everyone" on a bill means every guest who hasn't said they can't come, worked out
+  // when the numbers are shown, so people who RSVP or join later are included.
+  const billPeople = (h) => h.guests.filter((g) => g.rsvp !== "no").map((g) => g.friendId);
+  const splitOf = (h, e) => (e.everyone ? billPeople(h) : e.split || []).filter((x) => x && x !== EVERYONE);
+
+  // Per person, over the bills someone has paid: their share, what they paid, and the
+  // difference (positive: they get money back; negative: they owe).
+  function billBreakdown(h) {
+    const rows = {};
+    const row = (id) => rows[id] || (rows[id] = { id, share: 0, paid: 0 });
+    h.expenses.forEach((e) => {
+      const people = splitOf(h, e);
+      if (!people.length || !(e.amount > 0) || !e.paidBy) return;
+      row(e.paidBy).paid += e.amount;
+      people.forEach((id) => { row(id).share += e.amount / people.length; });
+    });
+    return Object.values(rows).map((r) => ({ ...r, balance: r.paid - r.share }));
+  }
+
   function balances(h) {
     const bal = {};
-    h.expenses.forEach((e) => {
-      const n = e.split.length;
-      if (!n || !e.amount || !e.paidBy) return;
-      bal[e.paidBy] = (bal[e.paidBy] || 0) + e.amount;
-      e.split.forEach((id) => { bal[id] = (bal[id] || 0) - e.amount / n; });
-    });
+    billBreakdown(h).forEach((r) => { bal[r.id] = r.balance; });
     return bal;
   }
   function settleUp(bal) {
@@ -1130,27 +1147,43 @@
     if (m === "split") {
       const bills = h.expenses;
       const moves = settleUp(balances(h));
-      const going = h.guests.filter((g) => g.rsvp === "going").map((g) => g.friendId);
-      const everyone = going.length ? going : guestIds;
+      const rows = billBreakdown(h).sort((a, b) => a.balance - b.balance || fname(a.id).localeCompare(fname(b.id)));
       const unpaid = bills.filter((e) => !e.paidBy).length;
+      const everyoneNow = billPeople(h);
+      const owesText = (r) => (Math.abs(r.balance) < 0.005 ? `<span class="muted">Even</span>`
+        : r.balance > 0 ? `<span class="gets">Gets ${money(r.balance)}</span>` : `<span class="owes">Owes ${money(-r.balance)}</span>`);
       return moduleShell(m, h, `
         ${bills.length ? `<ul class="list">${bills.map((e) => {
-          const n = e.split.length || 1;
+          const people = splitOf(h, e);
+          const n = people.length;
+          const who = !n ? "Nobody to split with yet" : `${money(e.amount / n)} each · ${e.everyone ? `everyone (${n})` : `${n} ${n === 1 ? "person" : "people"}`}`;
           return `<li data-id="${esc(e.id)}"><span class="item-body"><span class="grow"><b>${esc(e.text)}</b> <span class="money">${money(e.amount)}</span><br>
-            <span class="muted small">${money(e.amount / n)} each · ${n} ${n === 1 ? "person" : "people"}</span></span>
+            <span class="muted small">${who}</span></span>
             <span class="paid-by"><span class="muted small">Paid by</span>${friendSelect("paidby", e.paidBy, { blank: "Not paid yet" })}</span></span>
             <button class="icon-btn" data-action="remove-expense" aria-label="Remove ${esc(e.text)}">×</button></li>`;
         }).join("")}</ul>`
-          : `<p class="muted small">Add bills one person paid for the whole group, like dinner or the taxi. They're split evenly and we work out who owes whom.</p>`}
+          : `<p class="muted small">Add bills one person paid for the whole group, like dinner or the taxi. They're split evenly between everyone and we work out who owes whom.</p>`}
         <form class="field" data-form="add-expense" style="gap:8px">
           <div class="add-row">
             <input class="input" name="text" placeholder="What was it? e.g. Dinner" aria-label="Bill" required>
             <input class="input amount" name="amount" type="number" min="0" step="0.01" inputmode="decimal" placeholder="Total" aria-label="Total amount" required>
             ${friendSelect("paidBy", guestIds.includes(state.meId) ? state.meId : "", { blank: "Not paid yet" })}
           </div>
-          ${guestIds.length ? `<div class="split-pick" role="group" aria-label="Split between"><span class="muted small">Split between</span>${h.guests.map((g) => `<label><input type="checkbox" name="split" value="${esc(g.friendId)}" ${everyone.includes(g.friendId) ? "checked" : ""}>${esc(fname(g.friendId))}</label>`).join("")}</div>` : `<p class="muted small">Invite guests first to split bills between them.</p>`}
+          ${guestIds.length ? `<div class="split-pick" role="group" aria-label="Split between">
+            <span class="muted small">Split between</span>
+            <label class="split-all"><input type="checkbox" name="everyone" id="split-everyone" checked>Everyone (${everyoneNow.length})</label>
+            <span class="split-some" hidden>${h.guests.map((g) => `<label><input type="checkbox" name="split" value="${esc(g.friendId)}" ${g.rsvp !== "no" ? "checked" : ""}>${esc(fname(g.friendId))}</label>`).join("")}</span>
+          </div>` : `<p class="muted small">Add guests first to split bills between them.</p>`}
           <div><button class="btn btn-sm">Add bill</button></div>
         </form>
+        ${rows.length ? `<div class="breakdown">
+          <div class="bd-row bd-head"><span>Person</span><span>Share</span><span>Paid</span><span></span></div>
+          ${rows.map((r) => `<div class="bd-row ${r.id === state.meId || friend(r.id)?.uid === user?.uid ? "is-me" : ""}">
+            <span class="bd-name">${avatar(r.id)}<span>${esc(fname(r.id))}</span></span>
+            <span class="money">${money(r.share)}</span><span class="money">${money(r.paid)}</span><span class="bd-bal">${owesText(r)}</span></div>`).join("")}
+          <div class="bd-row bd-total"><span>Total</span><span class="money">${money(rows.reduce((t, r) => t + r.share, 0))}</span><span class="money">${money(rows.reduce((t, r) => t + r.paid, 0))}</span><span></span></div>
+          ${unpaid ? `<p class="muted small">${unpaid} bill${unpaid > 1 ? "s" : ""} marked “Not paid yet” ${unpaid > 1 ? "aren't" : "isn't"} counted until someone pays.</p>` : ""}
+        </div>` : ""}
         ${moves.length ? `<div class="settle"><b class="small">To settle up</b>${moves.map((x) => `<div class="settle-row">${avatar(x.from)}<b>${esc(fname(x.from))}</b><span class="arrow">pays</span>${avatar(x.to)}<b>${esc(fname(x.to))}</b><span class="money" style="margin-left:auto">${money(x.amount)}</span></div>`).join("")}</div>`
           : bills.some((e) => e.paidBy) ? `<div class="settle"><b class="small">Everyone's square.</b></div>` : ""}
       `, { sub: bills.length ? `${money(billsTotal(h))}${unpaid ? ` · ${unpaid} not paid` : ""}` : "" });
@@ -1800,10 +1833,11 @@
         commit(); $('[data-form="add-schedule"] input[name="text"]')?.focus(); break;
       case "add-expense": {
         const amount = Number(fd.get("amount"));
-        const split = fd.getAll("split");
+        const everyone = fd.get("everyone") === "on";
+        const split = everyone ? [] : fd.getAll("split");
         if (!(amount > 0)) { toast("Enter an amount above zero"); return; }
-        if (!split.length) { toast("Pick at least one person to split the bill with"); return; }
-        h.expenses.push({ id: uid(), text: fd.get("text").trim(), amount, paidBy: fd.get("paidBy") || "", split });
+        if (!everyone && !split.length) { toast("Pick at least one person to split the bill with"); return; }
+        h.expenses.push({ id: uid(), text: fd.get("text").trim(), amount, paidBy: fd.get("paidBy") || "", everyone, split });
         commit(); $('[data-form="add-expense"] input[name="text"]')?.focus(); break;
       }
       case "add-cost": {
@@ -1841,6 +1875,10 @@
       const list = el.closest("[data-module]").dataset.module;
       const it = h[list].find((x) => x.id === li.dataset.id);
       it.friendId = el.value; commit();
+    } else if (el.id === "split-everyone") {
+      const some = el.closest(".split-pick").querySelector(".split-some");
+      if (some) some.hidden = el.checked;
+      return;
     } else if (el.dataset.field === "paidby" && h) {
       const item = h.expenses.find((x) => x.id === el.closest("[data-id]").dataset.id);
       if (item) { item.paidBy = el.value; commit(); }

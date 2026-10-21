@@ -672,3 +672,29 @@ button.tag.perm[aria-pressed="true"] { background: var(--good-soft); color: var(
 .readonly select { appearance: none; -webkit-appearance: none; background: transparent; padding-right: 8px; }
 .readonly textarea { background: transparent; border-style: dashed; }
 .readonly .hero-actions .btn { grid-column: span 3; }
+
+/* ---------- Split the bill: breakdown ---------- */
+.split-some { display: contents; }
+.split-some[hidden] { display: none !important; }
+.split-all { font-weight: 700; }
+.breakdown { background: var(--surface-2); border-radius: 10px; padding: 6px 12px; display: flex; flex-direction: column; overflow-x: auto; }
+.bd-row {
+  display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(64px, 1fr) minmax(64px, 1fr) minmax(92px, 1.1fr);
+  gap: 8px; align-items: center; padding: 7px 0; border-top: 1px solid var(--line); font-size: .9rem;
+}
+.bd-row > span:not(.bd-name) { text-align: right; }
+.bd-head { border-top: 0; font-size: .72rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); padding-bottom: 4px; }
+.bd-total { font-weight: 700; }
+.bd-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.bd-name > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bd-row.is-me .bd-name > span:last-child { font-weight: 700; color: var(--accent); }
+.bd-bal { font-weight: 700; white-space: nowrap; }
+.gets { color: var(--good); }
+.owes { color: var(--bad); }
+.breakdown p { margin: 4px 0 2px; }
+@media (max-width: 640px) {
+  .bd-row { grid-template-columns: minmax(0, 1.3fr) minmax(56px, 1fr) minmax(56px, 1fr) minmax(84px, 1.1fr); gap: 6px; font-size: .84rem; }
+  .bd-name .avatar { display: none; }
+}
+.bd-row > span:first-child { text-align: left !important; }
+.paid-by > .muted { white-space: nowrap; }
