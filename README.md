@@ -26,7 +26,25 @@ python3 -m http.server 8000
 
 It also works as-is on GitHub Pages (Settings → Pages → deploy from the `main` branch).
 
-## Data
+## Accounts
 
-Everything is stored in your browser's `localStorage`. Use **Friends → Export backup** to save a
-JSON file and **Import backup** to restore it on another device.
+With Firebase set up, everyone signs in (email + password, or Google) and gets their own private
+hangouts, saved to their account and synced across every device they sign in on.
+
+1. Create a project at https://console.firebase.google.com (Google Analytics not needed).
+2. **Build → Authentication → Get started**, then enable **Email/Password** and **Google**.
+3. **Authentication → Settings → Authorized domains**: add `carambiasjohnerrol.github.io`.
+4. **Build → Firestore Database → Create database** (production mode), then paste
+   [`firestore.rules`](firestore.rules) into the **Rules** tab and publish.
+5. **Project settings → Your apps → Web (`</>`)**: register an app and copy its `firebaseConfig`
+   into [`firebase-config.js`](firebase-config.js).
+
+Each account's data is one Firestore document at `users/<uid>`, readable and writable only by
+that signed-in user. The first time someone signs up, any hangouts already saved in that browser
+move into their account.
+
+## Without accounts
+
+If `firebase-config.js` is left as `null`, the app skips sign-in and keeps everything in the
+browser's `localStorage`. Use **Friends → Export backup** to save a JSON file and
+**Import backup** to restore it.

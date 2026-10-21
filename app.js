@@ -98,21 +98,123 @@
     return { friends, hangouts: [bday, coffee, beach], currency: "$", examples: true, meId: you };
   }
 
+  // ---------- storage & accounts ----------
+  // With a Firebase config (firebase-config.js), each account keeps its data in
+  // Firestore at users/<uid> and must sign in first. Without one, the app runs on
+  // this browser's localStorage only, as before.
+
+  const FB_CONFIG = window.HANGOUT_FIREBASE_CONFIG;
+  const cloud = !!(FB_CONFIG && FB_CONFIG.apiKey);
+  const MIGRATED_KEY = "hangout-hq-moved-to-account";
+
+  const validState = (s) => !!(s && Array.isArray(s.hangouts) && Array.isArray(s.friends));
+  function readLocal() {
+    try { const raw = JSON.parse(localStorage.getItem(STORE_KEY)); if (validState(raw)) return raw; } catch (_) { /* none */ }
+    return null;
+  }
   function load() {
-    try {
-      const raw = JSON.parse(localStorage.getItem(STORE_KEY));
-      if (raw && Array.isArray(raw.hangouts) && Array.isArray(raw.friends)) return raw;
-    } catch (_) { /* fall through to seed */ }
+    const existing = readLocal();
+    if (existing) return existing;
     // Save the seed right away so its ids (and links to them) survive a reload.
     const fresh = seed();
     try { localStorage.setItem(STORE_KEY, JSON.stringify(fresh)); } catch (_) { /* storage unavailable */ }
     return fresh;
   }
 
-  let state = load();
+  let state = cloud ? null : load();
+  let auth = null, db = null, user = null;
+  let authReady = !cloud;    // cloud mode waits for Firebase to report who is signed in
+  let loadError = "";
+  let unsubDoc = null, saveTimer = null, lastSynced = "", creating = false, pendingName = "";
+
+  // Key-sorted JSON, so our own write echoing back from Firestore compares equal.
+  function stableJSON(v) {
+    if (Array.isArray(v)) return `[${v.map(stableJSON).join(",")}]`;
+    if (v && typeof v === "object") return `{${Object.keys(v).sort().filter((k) => v[k] !== undefined).map((k) => `${JSON.stringify(k)}:${stableJSON(v[k])}`).join(",")}}`;
+    return JSON.stringify(v === undefined ? null : v);
+  }
+
   const save = () => {
-    try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (_) { toast("Couldn't save in this browser"); }
+    if (!cloud) {
+      try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (_) { toast("Couldn't save in this browser"); }
+      return;
+    }
+    if (!user || !state) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(pushToCloud, 400);
   };
+
+  function pushToCloud() {
+    clearTimeout(saveTimer);
+    if (!user || !state) return Promise.resolve();
+    const json = stableJSON(state);
+    if (json === lastSynced) return Promise.resolve();
+    lastSynced = json;
+    return db.collection("users").doc(user.uid)
+      .set({ state: JSON.parse(json), updatedAt: firebase.firestore.FieldValue.serverTimestamp() })
+      .catch(() => { lastSynced = ""; toast("Couldn't save. Check your connection"); });
+  }
+
+  function startCloud() {
+    if (!window.firebase) {
+      authReady = true;
+      loadError = "Couldn't reach the sign-in service. Check your connection and reload.";
+      return;
+    }
+    firebase.initializeApp(FB_CONFIG);
+    auth = firebase.auth();
+    db = firebase.firestore();
+    auth.onAuthStateChanged((u) => {
+      authReady = true;
+      if (unsubDoc) { unsubDoc(); unsubDoc = null; }
+      user = u; state = null; lastSynced = ""; creating = false; loadError = "";
+      authMode = "signin";
+      render();
+      if (!u) return;
+      unsubDoc = db.collection("users").doc(u.uid).onSnapshot((snap) => {
+        if (snap.metadata.hasPendingWrites) return;
+        if (!snap.exists) { createAccountData(u); return; }
+        const remote = snap.data().state;
+        if (!validState(remote)) return;
+        const json = stableJSON(remote);
+        if (state && json === lastSynced) return; // our own save coming back
+        lastSynced = json;
+        state = remote;
+        render();
+      }, () => { loadError = "Couldn't load your hangouts. Check your connection and reload."; render(); });
+    });
+  }
+
+  // First sign-in: hangouts already in this browser move into the account (once);
+  // otherwise the account starts with the examples.
+  function createAccountData(u) {
+    if (creating) return;
+    creating = true;
+    const name = pendingName || u.displayName || (u.email || "").split("@")[0] || "You";
+    let moved = false;
+    let fresh = readLocal();
+    let alreadyMoved = false;
+    try { alreadyMoved = !!localStorage.getItem(MIGRATED_KEY); } catch (_) { /* ignore */ }
+    if (fresh && !fresh.examples && fresh.hangouts.length && !alreadyMoved) {
+      moved = true;
+      try { localStorage.setItem(MIGRATED_KEY, u.uid); } catch (_) { /* ignore */ }
+    } else {
+      fresh = seed();
+    }
+    const me = fresh.friends.find((f) => f.id === fresh.meId);
+    if (me && me.name === "You") me.name = name;
+    state = fresh;
+    pendingName = "";
+    render();
+    pushToCloud();
+    if (moved) toast("Moved the hangouts from this browser into your account");
+  }
+
+  async function signOut() {
+    await pushToCloud();
+    await auth.signOut();
+    location.hash = "#/";
+  }
 
   // ---------- helpers ----------
 
@@ -557,7 +659,7 @@
       </div>
       <section class="panel">
         <h2>Back up or move your data</h2>
-        <p class="muted small">Everything is saved in this browser only. Export a backup file to keep it safe or move it to another device.</p>
+        <p class="muted small">${cloud ? "Your hangouts are saved to your account and sync to every device you sign in on. You can still export a backup file." : "Everything is saved in this browser only. Export a backup file to keep it safe or move it to another device."}</p>
         <div class="row">
           <button class="btn btn-sm" data-action="export">Export backup</button>
           <label class="btn btn-sm">Import backup<input type="file" accept="application/json,.json" id="import-file" hidden></label>
@@ -565,6 +667,148 @@
         </div>
         <div id="confirm-slot"></div>
       </section>`;
+  }
+
+  // ---------- sign in / create account ----------
+
+  let authMode = "signin"; // "signin" | "signup" | "reset"
+
+  function renderAuth() {
+    const signup = authMode === "signup", reset = authMode === "reset";
+    const heading = signup ? "Create your account" : reset ? "Reset your password" : "Welcome back";
+    const sub = signup ? "Your hangouts, friends and plans, saved to your own account."
+      : reset ? "Enter your email and we'll send you a link to set a new password."
+      : "Sign in to see your hangouts.";
+    return `
+      <section class="auth">
+        <div class="auth-card">
+          <div class="auth-brand"><span class="brand-mark" aria-hidden="true"></span>Hangout HQ</div>
+          ${reset ? "" : `
+          <div class="auth-tabs" role="tablist" aria-label="Sign in or create an account">
+            <button role="tab" data-action="auth-mode" data-v="signin" aria-selected="${!signup}">Sign in</button>
+            <button role="tab" data-action="auth-mode" data-v="signup" aria-selected="${signup}">Create account</button>
+          </div>`}
+          <div class="auth-head"><h1>${heading}</h1><p class="muted">${sub}</p></div>
+          ${pendingImport ? `<div class="banner info small">Sign in to add <b>${esc(pendingImport.hangout.title)}</b> to your hangouts.</div>` : ""}
+          <form class="auth-form" data-form="auth" novalidate>
+            ${signup ? `<label class="field"><span>Your name</span><input class="input" id="auth-name" name="name" autocomplete="name" placeholder="What friends call you" required></label>` : ""}
+            <label class="field"><span>Email</span><input class="input" id="auth-email" name="email" type="email" autocomplete="email" inputmode="email" required></label>
+            ${reset ? "" : `<label class="field"><span>Password</span>
+              <span class="pw-wrap"><input class="input" id="auth-password" name="password" type="password" autocomplete="${signup ? "new-password" : "current-password"}" ${signup ? 'minlength="6" placeholder="At least 6 characters"' : ""} required>
+              <button type="button" class="pw-toggle" data-action="toggle-pw" aria-label="Show password">Show</button></span></label>`}
+            <p class="auth-error" id="auth-error" role="alert" hidden></p>
+            <p class="auth-note" id="auth-note" role="status" hidden></p>
+            <button class="btn btn-primary btn-block" id="auth-submit">${signup ? "Create account" : reset ? "Send reset link" : "Sign in"}</button>
+          </form>
+          ${reset ? `<button class="link-btn" data-action="auth-mode" data-v="signin">← Back to sign in</button>` : `
+            ${signup ? "" : `<button class="link-btn" data-action="auth-mode" data-v="reset">Forgot your password?</button>`}
+            <div class="divider"><span>or</span></div>
+            <button class="btn btn-block btn-google" data-action="google">
+              <svg viewBox="0 0 48 48" width="18" height="18" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="m6.3 14.7 6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-7.9l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z"/></svg>
+              Continue with Google
+            </button>`}
+          <p class="auth-foot muted small">Your hangouts are private to your account. Only you can see them.</p>
+        </div>
+      </section>`;
+  }
+
+  const AUTH_ERRORS = {
+    "auth/invalid-credential": "That email and password don't match. Check them and try again.",
+    "auth/wrong-password": "That email and password don't match. Check them and try again.",
+    "auth/user-not-found": "There's no account with that email. Create one instead.",
+    "auth/invalid-login-credentials": "That email and password don't match. Check them and try again.",
+    "auth/email-already-in-use": "There's already an account with that email. Sign in instead.",
+    "auth/invalid-email": "That doesn't look like an email address.",
+    "auth/missing-password": "Enter your password.",
+    "auth/weak-password": "Use a password with at least 6 characters.",
+    "auth/too-many-requests": "Too many tries. Wait a few minutes, or reset your password.",
+    "auth/network-request-failed": "Couldn't connect. Check your internet and try again.",
+    "auth/popup-blocked": "Your browser blocked the Google window. Allow pop-ups for this site and try again.",
+    "auth/unauthorized-domain": "Google sign-in isn't set up for this website yet. Use email and password for now.",
+    "auth/operation-not-allowed": "This sign-in method isn't turned on yet. Try the other one.",
+  };
+
+  function authMessage(kind, text) {
+    const err = $("#auth-error"), note = $("#auth-note");
+    if (err) { err.hidden = kind !== "error"; err.textContent = kind === "error" ? text : ""; }
+    if (note) { note.hidden = kind !== "note"; note.textContent = kind === "note" ? text : ""; }
+  }
+  function authBusy(busy) {
+    document.querySelectorAll(".auth-card button, .auth-card input").forEach((el) => { el.disabled = busy; });
+  }
+  function authFail(e) {
+    authBusy(false);
+    if (e && (e.code === "auth/popup-closed-by-user" || e.code === "auth/cancelled-popup-request")) return;
+    authMessage("error", AUTH_ERRORS[e && e.code] || "Something went wrong. Try again.");
+  }
+
+  async function submitAuth(form) {
+    const fd = new FormData(form);
+    const email = String(fd.get("email") || "").trim();
+    const password = String(fd.get("password") || "");
+    const name = String(fd.get("name") || "").trim();
+    if (!email) { authMessage("error", "Enter your email."); $("#auth-email").focus(); return; }
+    if (authMode === "signup" && !name) { authMessage("error", "Enter your name so friends know it's you."); $("#auth-name").focus(); return; }
+    if (authMode !== "reset" && !password) { authMessage("error", "Enter your password."); $("#auth-password").focus(); return; }
+    authMessage(null);
+    authBusy(true);
+    try {
+      if (authMode === "reset") {
+        await auth.sendPasswordResetEmail(email);
+        authBusy(false);
+        authMessage("note", `If there's an account for ${email}, a reset link is on its way. Check your inbox and spam folder.`);
+      } else if (authMode === "signup") {
+        pendingName = name;
+        const cred = await auth.createUserWithEmailAndPassword(email, password);
+        await cred.user.updateProfile({ displayName: name });
+      } else {
+        await auth.signInWithEmailAndPassword(email, password);
+      }
+    } catch (e) {
+      pendingName = "";
+      authFail(e);
+    }
+  }
+
+  async function googleSignIn() {
+    authMessage(null);
+    authBusy(true);
+    try {
+      await auth.signInWithPopup(new firebase.auth.GoogleAuthProvider());
+    } catch (e) { authFail(e); }
+  }
+
+  function updateAccountButton() {
+    const btn = $(".account-btn");
+    if (!btn) return;
+    const show = cloud && !!user && !!state;
+    btn.hidden = !show;
+    if (!show) return;
+    const me = friend(state.meId);
+    const name = user.displayName || me?.name || user.email || "?";
+    btn.textContent = initials(name);
+    btn.style.background = me?.color || COLORS[0];
+    btn.title = `${name} · ${user.email || ""}`;
+  }
+
+  function openAccountDialog() {
+    const dlg = $("#dialog");
+    const me = friend(state.meId);
+    const name = user.displayName || me?.name || "";
+    dlg.innerHTML = `
+      <form method="dialog" class="account-sheet">
+        <h2>Your account</h2>
+        <div class="account-id">
+          <span class="avatar" style="background:${esc(me?.color || COLORS[0])}">${esc(initials(name || user.email || "?"))}</span>
+          <div class="grow"><b>${esc(name || "No name set")}</b><span class="muted small">${esc(user.email || "")}</span></div>
+        </div>
+        <p class="muted small">Your hangouts are saved to this account. Sign in with the same email on any phone or computer to see them.</p>
+        <div class="dialog-actions">
+          <button type="button" class="btn" data-action="close-dialog">Close</button>
+          <button type="button" class="btn btn-danger" data-action="sign-out">Sign out</button>
+        </div>
+      </form>`;
+    dlg.showModal();
   }
 
   // ---------- router ----------
@@ -585,6 +829,16 @@
 
   function render() {
     const app = $("#app");
+    const signedOut = cloud && (!user || !state);
+    document.body.classList.toggle("signed-out", signedOut);
+    updateAccountButton();
+    if (signedOut) {
+      if (loadError) app.innerHTML = `<div class="empty"><b>${esc(loadError)}</b><button class="btn" data-action="reload">Reload</button></div>`;
+      else if (!authReady || user) app.innerHTML = `<div class="loading" role="status"><span class="spinner" aria-hidden="true"></span>${user ? "Loading your hangouts…" : "Loading…"}</div>`;
+      else app.innerHTML = renderAuth();
+      document.title = "Hangout HQ";
+      return;
+    }
     const hash = location.hash || "#/";
     let html, nav = "home";
     const m = hash.match(/^#\/h\/([\w-]+)/);
@@ -727,12 +981,25 @@
     const id = li?.dataset.id;
 
     switch (action) {
+      case "auth-mode": authMode = btn.dataset.v; render(); $("#auth-email")?.focus(); break;
+      case "toggle-pw": {
+        const pw = $("#auth-password");
+        const show = pw.type === "password";
+        pw.type = show ? "text" : "password";
+        btn.textContent = show ? "Hide" : "Show";
+        btn.setAttribute("aria-label", show ? "Hide password" : "Show password");
+        break;
+      }
+      case "google": googleSignIn(); break;
+      case "account": openAccountDialog(); break;
+      case "sign-out": closeDialog(); signOut(); toast("Signed out"); break;
+      case "reload": location.reload(); break;
       case "new-hangout": openHangoutDialog(null); break;
       case "edit-hangout": openHangoutDialog(h); break;
       case "close-dialog": closeDialog(); break;
       case "filter": filter = btn.dataset.v; render(); break;
       case "clear-examples":
-        state = { friends: [state.friends.find((f) => f.name === "You") || { id: uid(), name: "You", color: COLORS[0] }], hangouts: [], currency: state.currency, examples: false };
+        state = { friends: [friend(state.meId) || { id: uid(), name: "You", color: COLORS[0] }], hangouts: [], currency: state.currency, examples: false };
         state.meId = state.friends[0].id;
         commit(); toast("Examples cleared"); break;
       case "rsvp": {
@@ -800,9 +1067,10 @@
         break;
       }
       case "reset-all":
-        confirmInline("Erase every hangout and friend in this browser?", "Erase everything", () => {
-          try { localStorage.removeItem(STORE_KEY); } catch (_) { /* ignore */ }
-          state = { friends: [{ id: uid(), name: "You", color: COLORS[0] }], hangouts: [], currency: state.currency, examples: false };
+        confirmInline(`Erase every hangout and friend ${cloud ? "in your account" : "in this browser"}?`, "Erase everything", () => {
+          if (!cloud) { try { localStorage.removeItem(STORE_KEY); } catch (_) { /* ignore */ } }
+          const me = friend(state.meId);
+          state = { friends: [me ? { ...me } : { id: uid(), name: "You", color: COLORS[0] }], hangouts: [], currency: state.currency, examples: false };
           state.meId = state.friends[0].id;
           commit(); toast("Everything erased");
         });
@@ -823,6 +1091,7 @@
     const form = e.target.closest("[data-form]");
     if (!form) return;
     e.preventDefault();
+    if (form.dataset.form === "auth") { submitAuth(form); return; }
     const fd = new FormData(form);
     const h = currentHangout();
     switch (form.dataset.form) {
@@ -910,5 +1179,6 @@
   });
 
   window.addEventListener("hashchange", route);
+  if (cloud) startCloud();
   route();
 })();
