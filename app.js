@@ -315,7 +315,7 @@
 
   // Resize so the longest side is at most `maxSide` and re-encode as JPEG, shrinking
   // until it fits well under Firestore's 1 MB document limit.
-  async function compressImage(file, maxSide) {
+  async function compressImage(file, maxSide, startQuality = 0.82) {
     const url = URL.createObjectURL(file);
     try {
       const img = await new Promise((res, rej) => {
@@ -324,7 +324,7 @@
         i.onerror = () => rej(new Error("decode"));
         i.src = url;
       });
-      let max = maxSide, quality = 0.82, out = "";
+      let max = maxSide, quality = startQuality, out = "";
       for (let tries = 0; tries < 6; tries++) {
         const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
         const w = Math.max(1, Math.round(img.naturalWidth * scale));
@@ -1085,7 +1085,8 @@
         const btn = $("#place-save");
         btn.disabled = true; btn.textContent = "Uploading photo…";
         try {
-          const data = await compressImage(pendingFile, 1200);
+          // Place photos show small, so keep them light: 640px, lower JPEG quality.
+          const data = await compressImage(pendingFile, 640, 0.68);
           const id = PUBLIC_PREFIX + uid() + uid();
           await photoStore.put(id, data, "place");
           photoCache.set(id, data);
@@ -1182,8 +1183,9 @@
   function pickRow(p, { shared = false } = {}) {
     const map = recMapLink(p);
     const targets = shared ? [] : [...state.hangouts, ...joinedHangouts.filter(canEdit)].filter((h) => !isPast(h));
-    return `<li class="rec pick ${p.photoId ? "has-cover" : ""}" data-id="${esc(p.id || "")}">
-      ${p.photoId ? `<div class="place-banner">${photoImg(p.photoId, `Photo of ${p.name}`)}</div>` : ""}
+    const letter = (p.kind || p.name || "?").trim().charAt(0).toUpperCase();
+    return `<li class="rec pick" data-id="${esc(p.id || "")}">
+      <span class="pick-thumb" aria-hidden="true">${p.photoId ? photoImg(p.photoId, "") : `<span class="pick-letter">${esc(letter)}</span>`}</span>
       <span class="grow">
         <b>${esc(p.name)}</b>
         <span class="muted small">${shared && p.rating ? `<span class="stars-avg">${starString(p.rating)}</span> · ` : ""}${esc(p.kind || "Place")}${p.cuisine && p.cuisine !== p.kind ? ` · ${esc(p.cuisine)}` : ""}${p.where ? ` · ${esc(p.where)}` : ""}</span>
@@ -1195,12 +1197,12 @@
       <span class="idea-actions">
         ${map ? `<a class="btn btn-sm btn-ghost" href="${map}" target="_blank" rel="noopener">Map</a>` : ""}
         ${shared ? (isPicked(p) ? `<span class="tag">Saved</span>` : `<button class="btn btn-sm btn-primary" data-action="list-save" data-i="${p._i}">Save to my picks</button>`) : `
-          ${targets.length ? `<select class="select who pick-target" data-field="pick-to-hangout" aria-label="Add ${esc(p.name)} to a hangout">
-            <option value="">Add to hangout…</option>
+          <select class="select who pick-target" data-field="pick-to-hangout" aria-label="Add ${esc(p.name)} to a hangout">
+            <option value="">Add to…</option>
+            <option value="__new">New hangout here</option>
             ${targets.map((h) => `<option value="${esc(h.id)}" ${(h.recs || []).some((r) => samePlace(r, p)) ? "disabled" : ""}>${esc(h.title)}</option>`).join("")}
-          </select>` : ""}
+          </select>
           <button class="btn btn-sm" data-action="edit-pick">Edit</button>
-          <button class="btn btn-sm" data-action="pick-plan">Plan here</button>
           <button class="icon-btn" data-action="remove-pick" aria-label="Remove ${esc(p.name)}">×</button>`}
       </span>
     </li>`;
@@ -2672,6 +2674,11 @@
       it.friendId = el.value; commit();
     } else if (el.dataset.field === "pick-to-hangout") {
       const pick = (state.picks || []).find((p) => p.id === el.closest("[data-id]")?.dataset.id);
+      if (pick && el.value === "__new") {
+        el.value = "";
+        openHangoutDialog(null, { title: `Hangout at ${pick.name}`, place: pick.where ? `${pick.name}, ${pick.where}` : pick.name });
+        return;
+      }
       const target = hangout(el.value);
       if (pick && target && canEdit(target)) recommendPlace(target, pick);
       el.value = "";
