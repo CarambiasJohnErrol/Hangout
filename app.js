@@ -180,6 +180,7 @@
         if (state && json === lastSynced) return; // our own save coming back
         lastSynced = json;
         state = remote;
+        if (retireGallery(state)) save();
         render();
       }, () => { loadError = "Couldn't load your hangouts. Check your connection and reload."; render(); });
     });
@@ -216,14 +217,14 @@
     location.hash = "#/";
   }
 
-  // ---------- photos ----------
-  // Hangouts keep only photo metadata ({id, w, h, addedAt}). The image itself is a
-  // resized JPEG data URL stored on its own: in Firestore at users/<uid>/photos/<id>
-  // when signed in, or in this browser's IndexedDB without accounts.
+  // ---------- pictures (profile + hangout covers) ----------
+  // State keeps only picture ids: a friend's `photoId` and a hangout's `cover.id`.
+  // The image is a resized JPEG data URL stored on its own: in Firestore at
+  // users/<uid>/photos/<id> when signed in, or in this browser's IndexedDB without accounts.
 
   const photoCache = new Map();   // id -> data URL, or null when it can't be found
   const photoLoads = new Map();   // id -> in-flight promise
-  const uploading = {};           // hangout id -> photos still being processed
+  const busy = { profile: false, covers: {} };
 
   const idb = (() => {
     let opening;
@@ -251,9 +252,9 @@
 
   const photoDoc = (id) => db.collection("users").doc(user.uid).collection("photos").doc(id);
   const photoStore = {
-    put(id, data, hangoutId) {
+    put(id, data, kind) {
       if (!cloud) return idb.put(id, data);
-      return photoDoc(id).set({ data, hangoutId, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
+      return photoDoc(id).set({ data, kind, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
     },
     async get(id) {
       if (!cloud) return (await idb.get(id)) || null;
@@ -261,11 +262,12 @@
       return snap.exists ? snap.data().data : null;
     },
     del(id) {
+      if (!id) return Promise.resolve();
       photoCache.delete(id);
       return (cloud ? photoDoc(id).delete() : idb.del(id)).catch(() => { /* already gone */ });
     },
   };
-  const deletePhotosOf = (hangouts) => hangouts.forEach((x) => (x.photos || []).forEach((ph) => photoStore.del(ph.id)));
+  const deleteCoversOf = (hangouts) => hangouts.forEach((x) => photoStore.del(x.cover?.id));
 
   function loadPhoto(id) {
     if (photoCache.has(id)) return Promise.resolve(photoCache.get(id));
@@ -278,19 +280,23 @@
     return photoLoads.get(id);
   }
 
-  // Fill in any <img data-photo> that has no source yet.
+  // Fill in any <img data-photo> that has no source yet; drop it if the picture is gone.
   function hydratePhotos(root) {
     root.querySelectorAll("img[data-photo]:not([src])").forEach((img) => {
       loadPhoto(img.dataset.photo).then((src) => {
         if (src) img.src = src;
-        else img.closest(".photo-tile, .lb-stage")?.classList.add("missing");
+        else img.remove();
       });
     });
   }
+  const photoImg = (id, alt = "") => {
+    const src = photoCache.get(id);
+    return `<img data-photo="${esc(id)}" alt="${esc(alt)}" ${src ? `src="${src}"` : ""}>`;
+  };
 
-  // Resize to at most 1600px and re-encode as JPEG, shrinking until it fits well
-  // under Firestore's 1 MB document limit.
-  async function compressImage(file) {
+  // Resize so the longest side is at most `maxSide` and re-encode as JPEG, shrinking
+  // until it fits well under Firestore's 1 MB document limit.
+  async function compressImage(file, maxSide) {
     const url = URL.createObjectURL(file);
     try {
       const img = await new Promise((res, rej) => {
@@ -299,11 +305,11 @@
         i.onerror = () => rej(new Error("decode"));
         i.src = url;
       });
-      let max = 1600, quality = 0.82, out = "", w = 0, ht = 0;
+      let max = maxSide, quality = 0.82, out = "";
       for (let tries = 0; tries < 6; tries++) {
         const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
-        w = Math.max(1, Math.round(img.naturalWidth * scale));
-        ht = Math.max(1, Math.round(img.naturalHeight * scale));
+        const w = Math.max(1, Math.round(img.naturalWidth * scale));
+        const ht = Math.max(1, Math.round(img.naturalHeight * scale));
         const c = document.createElement("canvas");
         c.width = w; c.height = ht;
         const ctx = c.getContext("2d");
@@ -315,128 +321,93 @@
         max = Math.round(max * 0.8);
         quality = Math.max(0.6, quality - 0.08);
       }
-      return { data: out, w, h: ht };
+      return out;
     } finally {
       URL.revokeObjectURL(url);
     }
   }
 
-  async function addPhotos(hangoutId, files) {
-    const images = files.filter((f) => f.type.startsWith("image/") || /\.(heic|heif)$/i.test(f.name));
-    if (!images.length) { toast("Pick a photo or image file"); return; }
-    uploading[hangoutId] = (uploading[hangoutId] || 0) + images.length;
+  const isImage = (f) => f && (f.type.startsWith("image/") || /\.(heic|heif)$/i.test(f.name));
+
+  async function uploadPicture(file, maxSide, kind) {
+    const data = await compressImage(file, maxSide);
+    const id = uid();
+    await photoStore.put(id, data, kind);
+    photoCache.set(id, data);
+    return id;
+  }
+
+  function pictureError(e) {
+    toast(e && e.message === "decode" ? "That picture couldn't be opened. Try a JPEG or PNG" : "The picture didn't upload. Check your connection and try again");
+  }
+
+  async function setCover(hangoutId, file) {
+    if (!isImage(file)) { toast("Pick a photo or image file"); return; }
+    busy.covers[hangoutId] = true;
     render();
-    let added = 0, unreadable = 0, failed = 0;
-    for (const file of images) {
-      try {
-        const { data, w, h: height } = await compressImage(file);
-        const id = uid();
-        await photoStore.put(id, data, hangoutId);
-        photoCache.set(id, data);
-        const target = hangout(hangoutId);
-        if (target) {
-          (target.photos || (target.photos = [])).push({ id, w, h: height, addedAt: Date.now() });
-          added++;
-          save();
-        } else {
-          photoStore.del(id);
-        }
-      } catch (e) {
-        if (e && e.message === "decode") unreadable++; else failed++;
-      }
-      uploading[hangoutId]--;
+    try {
+      const id = await uploadPicture(file, 1600, "cover");
+      const h = hangout(hangoutId);
+      if (!h) { photoStore.del(id); return; }
+      const old = h.cover?.id;
+      h.cover = { id };
+      save();
+      photoStore.del(old);
+      toast("Cover photo updated");
+    } catch (e) {
+      pictureError(e);
+    } finally {
+      delete busy.covers[hangoutId];
       render();
     }
-    if (unreadable) toast(`${unreadable} photo${unreadable > 1 ? "s" : ""} couldn't be opened. Try a JPEG or PNG`);
-    else if (failed) toast(`${failed} photo${failed > 1 ? "s" : ""} didn't upload. Check your connection and try again`);
-    else if (added) toast(`${added} photo${added > 1 ? "s" : ""} added`);
+  }
+  function removeCover(h) {
+    photoStore.del(h.cover?.id);
+    h.cover = null;
   }
 
-  function photosHTML(h) {
-    const list = h.photos || [];
-    const pending = uploading[h.id] || 0;
-    const tiles = list.map((ph, i) => {
-      const src = photoCache.get(ph.id);
-      return `<button class="photo-tile" data-action="open-photo" data-i="${i}" aria-label="Open photo ${i + 1} of ${list.length}">
-        <img data-photo="${esc(ph.id)}" alt="" ${src ? `src="${src}"` : ""}></button>`;
-    }).join("") + Array.from({ length: pending }, () => `<div class="photo-tile uploading" role="status" aria-label="Uploading photo"><span class="spinner" aria-hidden="true"></span></div>`).join("");
-    return `
-      <section class="module wide photos" data-module="photos">
-        <div class="module-head"><h2>Photos</h2>
-          <div class="row" style="gap:8px">${list.length ? `<span class="muted">${list.length}</span>` : ""}
-            <label class="btn btn-sm photo-add"><span aria-hidden="true">+</span> Add photos<input type="file" id="photo-input" accept="image/*" multiple hidden></label>
-          </div>
-        </div>
-        ${list.length || pending ? `<div class="photo-grid">${tiles}</div>`
-          : `<p class="muted small">Add pictures from the day, the venue, or anything worth remembering.</p>`}
-      </section>`;
+  async function setProfilePicture(file) {
+    if (!isImage(file)) { toast("Pick a photo or image file"); return; }
+    const me = friend(state.meId);
+    if (!me) return;
+    busy.profile = true;
+    render(); refreshAccountDialog();
+    try {
+      const id = await uploadPicture(file, 480, "profile");
+      const old = me.photoId;
+      me.photoId = id;
+      save();
+      photoStore.del(old);
+      toast("Profile picture updated");
+    } catch (e) {
+      pictureError(e);
+    } finally {
+      busy.profile = false;
+      render(); refreshAccountDialog();
+    }
+  }
+  function removeProfilePicture() {
+    const me = friend(state.meId);
+    if (!me?.photoId) return;
+    photoStore.del(me.photoId);
+    delete me.photoId;
+    commit(); refreshAccountDialog();
+    toast("Profile picture removed");
   }
 
-  // ---------- photo viewer ----------
-
-  let viewer = null; // { hangoutId, i }
-
-  function openViewer(hangoutId, i) {
-    viewer = { hangoutId, i };
-    renderViewer();
-    const lb = $("#lightbox");
-    if (!lb.open) lb.showModal();
-  }
-  function closeViewer() {
-    viewer = null;
-    const lb = $("#lightbox");
-    if (lb.open) lb.close();
-  }
-  function stepViewer(d) {
-    const list = hangout(viewer.hangoutId)?.photos || [];
-    if (list.length < 2) return;
-    viewer.i = (viewer.i + d + list.length) % list.length;
-    renderViewer();
-  }
-  function renderViewer() {
-    const h = hangout(viewer.hangoutId);
-    const list = h?.photos || [];
-    if (!list.length) { closeViewer(); return; }
-    viewer.i = Math.max(0, Math.min(viewer.i, list.length - 1));
-    const ph = list[viewer.i];
-    const src = photoCache.get(ph.id);
-    const many = list.length > 1;
-    const lb = $("#lightbox");
-    lb.innerHTML = `
-      <div class="lb-top">
-        <span class="lb-count num">${viewer.i + 1} / ${list.length}</span>
-        <span class="lb-actions">
-          <button class="lb-btn" data-action="delete-photo">Delete</button>
-          <button class="lb-btn lb-close" data-action="close-photo" aria-label="Close photo">×</button>
-        </span>
-      </div>
-      <div class="lb-stage">
-        ${many ? `<button class="lb-nav prev" data-action="photo-prev" aria-label="Previous photo">‹</button>` : ""}
-        <img data-photo="${esc(ph.id)}" alt="Photo ${viewer.i + 1} from ${esc(h.title)}" ${src ? `src="${src}"` : ""}>
-        ${many ? `<button class="lb-nav next" data-action="photo-next" aria-label="Next photo">›</button>` : ""}
-      </div>
-      <div class="lb-foot">
-        <span>Added ${esc(new Date(ph.addedAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }))}</span>
-        <div id="lb-confirm"></div>
-      </div>`;
-    if (!src) hydratePhotos(lb);
-  }
-
-  function confirmDeletePhoto() {
-    const slot = $("#lb-confirm");
-    slot.innerHTML = `<div class="lb-confirm"><span>Delete this photo? It can't be undone.</span>
-      <span class="row"><button class="lb-btn danger" id="lb-yes">Delete photo</button><button class="lb-btn" id="lb-no">Cancel</button></span></div>`;
-    $("#lb-no").onclick = () => { slot.innerHTML = ""; };
-    $("#lb-yes").onclick = () => {
-      const h = hangout(viewer.hangoutId);
-      const ph = h.photos[viewer.i];
-      h.photos = h.photos.filter((x) => x.id !== ph.id);
-      photoStore.del(ph.id);
-      commit();
-      toast("Photo deleted");
-      if (h.photos.length) renderViewer(); else closeViewer();
-    };
-    $("#lb-yes").focus();
+  // The earlier photo gallery is gone: its first photo becomes the hangout's cover
+  // (if it has none) and the rest are deleted.
+  function retireGallery(s) {
+    let changed = false;
+    s.hangouts.forEach((h) => {
+      if (!Array.isArray(h.photos)) return;
+      const list = h.photos;
+      if (list.length && !h.cover) { h.cover = { id: list[0].id }; list.slice(1).forEach((ph) => photoStore.del(ph.id)); }
+      else list.forEach((ph) => photoStore.del(ph.id));
+      delete h.photos;
+      changed = true;
+    });
+    return changed;
   }
 
   // ---------- helpers ----------
@@ -455,7 +426,7 @@
   function avatar(id, extra = "") {
     const f = friend(id);
     const name = f?.name || "?";
-    return `<span class="avatar ${extra}" style="background:${esc(f?.color || "#888")}" title="${esc(name)}">${esc(initials(name))}</span>`;
+    return `<span class="avatar ${extra}" style="background:${esc(f?.color || "#888")}" title="${esc(name)}">${esc(initials(name))}${f?.photoId ? photoImg(f.photoId) : ""}</span>`;
   }
 
   function parseDate(h) {
@@ -531,7 +502,7 @@
       ...h.guests.map((g) => g.friendId), ...h.bring.map((b) => b.friendId), ...h.tasks.map((t) => t.friendId),
       ...h.expenses.flatMap((e) => [e.paidBy, ...e.split]), ...(h.poll?.options || []).flatMap((o) => o.votes),
     ].filter(Boolean));
-    const payload = { v: 1, hangout: { ...h, photos: [] }, friends: state.friends.filter((f) => ids.has(f.id)) };
+    const payload = { v: 1, hangout: { ...h, cover: null }, friends: state.friends.filter((f) => ids.has(f.id)).map(({ photoId, ...f }) => f) };
     const bytes = new TextEncoder().encode(JSON.stringify(payload));
     let bin = "";
     bytes.forEach((b) => { bin += String.fromCharCode(b); });
@@ -557,7 +528,7 @@
     });
     const r = (id) => map[id] || id;
     const h = JSON.parse(JSON.stringify(data.hangout));
-    h.photos = [];
+    h.cover = null;
     const sameId = state.hangouts.findIndex((x) => x.id === h.id);
     h.guests.forEach((g) => { g.friendId = r(g.friendId); });
     h.bring.forEach((b) => { b.friendId = r(b.friendId); });
@@ -672,7 +643,8 @@
     const shown = going.slice(0, 5);
     const openTasks = h.tasks.filter((t) => !t.done).length;
     return `
-      <a class="card" href="#/h/${esc(h.id)}">
+      <a class="card ${h.cover ? "has-cover" : ""}" href="#/h/${esc(h.id)}">
+        ${h.cover ? `<div class="card-cover">${photoImg(h.cover.id)}</div>` : ""}
         <div class="card-top">
           <div class="datebox ${d ? "" : "tbd"}">${d ? `<span>${d.toLocaleDateString(undefined, { month: "short" })}</span><b>${d.getDate()}</b>` : "<b>TBD</b>"}</div>
           <div class="card-title">
@@ -684,10 +656,26 @@
         <div class="card-foot">
           <div class="row" style="gap:10px">
             <div class="avatars">${shown.map((g) => avatar(g.friendId)).join("")}${going.length > 5 ? `<span class="avatar more">+${going.length - 5}</span>` : ""}</div>
-            <span class="muted small">${going.length} going${openTasks ? ` · ${openTasks} to-do${openTasks > 1 ? "s" : ""} left` : ""}${(h.photos || []).length ? ` · ${h.photos.length} photo${h.photos.length > 1 ? "s" : ""}` : ""}</span>
+            <span class="muted small">${going.length} going${openTasks ? ` · ${openTasks} to-do${openTasks > 1 ? "s" : ""} left` : ""}</span>
           </div>
         </div>
       </a>`;
+  }
+
+  function coverHTML(h) {
+    const working = !!busy.covers[h.id];
+    const picker = (label, cls) => `<label class="${cls}" ${working ? 'aria-disabled="true"' : ""}>${label}<input type="file" accept="image/*" data-upload="cover" hidden ${working ? "disabled" : ""}></label>`;
+    if (h.cover || working) {
+      return `<div class="hero-cover">
+        ${h.cover ? photoImg(h.cover.id, `Cover photo for ${h.title}`) : ""}
+        ${working ? `<div class="cover-busy" role="status"><span class="spinner" aria-hidden="true"></span>Uploading…</div>` : ""}
+        <div class="cover-actions">
+          ${picker("Change cover", "cover-btn")}
+          ${h.cover && !working ? `<button class="cover-btn" data-action="remove-cover">Remove</button>` : ""}
+        </div>
+      </div>`;
+    }
+    return `<div class="cover-empty">${picker('<span aria-hidden="true">+</span> Add cover photo', "btn btn-sm btn-ghost add-cover")}</div>`;
   }
 
   function renderHangout(h) {
@@ -711,7 +699,8 @@
     const order = ["guests", "tasks", "bring", "schedule", "budget", "poll", "notes"];
     return `
       <a href="#/" class="back">← All hangouts</a>
-      <section class="hero">
+      <section class="hero ${h.cover ? "has-cover" : ""}">
+        ${coverHTML(h)}
         <div class="hero-top">
           <div class="hero-title">
             ${sizePill(h.size)}
@@ -733,7 +722,6 @@
         <div class="progress">${stats}</div>
         <div id="confirm-slot"></div>
       </section>
-      ${photosHTML(h)}
       <div class="modules">
         ${order.filter(has).map((m) => moduleHTML(m, h)).join("")}
       </div>
@@ -870,6 +858,10 @@
     const sorted = [...state.friends].sort((a, b) => (a.id === state.meId ? -1 : b.id === state.meId ? 1 : a.name.localeCompare(b.name)));
     return `
       <div class="home-head"><div><h1>Friends</h1><p class="muted">Everyone you hang out with. Add them once, invite them to anything.</p></div></div>
+      ${friend(state.meId) ? `<section class="profile-card">
+        ${avatar(state.meId, "avatar-lg")}
+        <div class="grow"><span class="eyebrow">Your profile</span><b>${esc(friend(state.meId).name)}</b>${profilePictureControls()}</div>
+      </section>` : ""}
       <form class="add-row" data-form="add-friend" style="max-width:480px">
         <input class="input" name="name" placeholder="Friend's name" aria-label="Friend's name" required>
         <button class="btn btn-primary btn-sm">Add friend</button>
@@ -1011,21 +1003,33 @@
     if (!show) return;
     const me = friend(state.meId);
     const name = user.displayName || me?.name || user.email || "?";
-    btn.textContent = initials(name);
+    btn.innerHTML = `${esc(initials(name))}${me?.photoId ? photoImg(me.photoId) : ""}`;
+    hydratePhotos(btn);
     btn.style.background = me?.color || COLORS[0];
     btn.title = `${name} · ${user.email || ""}`;
   }
 
-  function openAccountDialog() {
-    const dlg = $("#dialog");
+  // Profile picture controls, shared by the account dialog and the Friends page.
+  function profilePictureControls() {
+    const me = friend(state.meId);
+    if (busy.profile) return `<span class="muted small row" role="status"><span class="spinner" aria-hidden="true"></span>Uploading…</span>`;
+    return `<span class="row pic-controls">
+      <label class="btn btn-sm">${me?.photoId ? "Change photo" : "Add profile photo"}<input type="file" accept="image/*" data-upload="profile" hidden></label>
+      ${me?.photoId ? `<button type="button" class="btn btn-sm btn-ghost btn-danger" data-action="remove-profile-pic">Remove</button>` : ""}
+    </span>`;
+  }
+
+  function accountDialogHTML() {
     const me = friend(state.meId);
     const name = user.displayName || me?.name || "";
-    dlg.innerHTML = `
+    return `
       <form method="dialog" class="account-sheet">
         <h2>Your account</h2>
         <div class="account-id">
-          <span class="avatar" style="background:${esc(me?.color || COLORS[0])}">${esc(initials(name || user.email || "?"))}</span>
-          <div class="grow"><b>${esc(name || "No name set")}</b><span class="muted small">${esc(user.email || "")}</span></div>
+          ${avatar(state.meId, "avatar-lg")}
+          <div class="grow"><b>${esc(name || "No name set")}</b><span class="muted small">${esc(user.email || "")}</span>
+            ${profilePictureControls()}
+          </div>
         </div>
         <p class="muted small">Your hangouts are saved to this account. Sign in with the same email on any phone or computer to see them.</p>
         <div class="dialog-actions">
@@ -1033,7 +1037,20 @@
           <button type="button" class="btn btn-danger" data-action="sign-out">Sign out</button>
         </div>
       </form>`;
+  }
+
+  function openAccountDialog() {
+    const dlg = $("#dialog");
+    dlg.innerHTML = accountDialogHTML();
+    dlg.dataset.kind = "account";
+    hydratePhotos(dlg);
     dlg.showModal();
+  }
+  function refreshAccountDialog() {
+    const dlg = $("#dialog");
+    if (!dlg.open || dlg.dataset.kind !== "account" || !user) return;
+    dlg.innerHTML = accountDialogHTML();
+    hydratePhotos(dlg);
   }
 
   // ---------- router ----------
@@ -1043,7 +1060,6 @@
   function route() {
     const dlg = $("#dialog");
     if (dlg.open) dlg.close();
-    if (viewer) closeViewer();
     const hash = location.hash || "#/";
     if (hash.startsWith("#/import/")) {
       pendingImport = decodeShare(hash.slice(9));
@@ -1106,6 +1122,10 @@
     const dlg = $("#dialog");
     const isNew = !h;
     const v = h || { title: "", size: 1, date: "", time: "", endTime: "", place: "", description: "" };
+    dlg.dataset.kind = "hangout";
+    let pendingCover = null;     // a File chosen in this dialog
+    let dropCover = false;       // "Remove" pressed for the existing cover
+    let previewUrl = null;
     dlg.innerHTML = `
       <form method="dialog" id="hangout-form">
         <h2>${isNew ? "Plan a hangout" : "Edit details"}</h2>
@@ -1126,13 +1146,41 @@
         </div>
         <label class="field"><span>Where</span><input class="input" id="f-place" name="place" value="${esc(v.place)}" placeholder="Leave blank if undecided"></label>
         <label class="field"><span>Details</span><textarea class="textarea" id="f-desc" name="description" placeholder="Anything people should know">${esc(v.description)}</textarea></label>
+        <div class="field"><span>Cover photo</span>
+          <div class="cover-pick">
+            <div class="cover-preview" id="cover-preview">${v.cover ? photoImg(v.cover.id) : '<span class="muted small">No cover photo</span>'}</div>
+            <div class="row">
+              <label class="btn btn-sm">${v.cover ? "Change" : "Choose photo"}<input type="file" accept="image/*" id="f-cover" hidden></label>
+              <button type="button" class="btn btn-sm btn-ghost btn-danger" id="f-cover-remove" ${v.cover ? "" : "hidden"}>Remove</button>
+            </div>
+          </div>
+        </div>
         <div class="dialog-actions">
           <button type="button" class="btn" data-action="close-dialog">Cancel</button>
           <button class="btn btn-primary" value="save">${isNew ? "Create hangout" : "Save changes"}</button>
         </div>
       </form>`;
+    hydratePhotos(dlg);
     dlg.showModal();
     $("#f-title").focus();
+    const preview = $("#cover-preview"), removeBtn = $("#f-cover-remove");
+    const showNoCover = () => { preview.innerHTML = '<span class="muted small">No cover photo</span>'; removeBtn.hidden = true; };
+    $("#f-cover").addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      e.target.value = "";
+      if (!file) return;
+      if (!isImage(file)) { toast("Pick a photo or image file"); return; }
+      pendingCover = file; dropCover = false;
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = URL.createObjectURL(file);
+      preview.innerHTML = `<img src="${previewUrl}" alt="New cover photo">`;
+      removeBtn.hidden = false;
+    });
+    removeBtn.addEventListener("click", () => {
+      pendingCover = null; dropCover = !!v.cover;
+      showNoCover();
+    });
+    dlg.addEventListener("close", () => { if (previewUrl) URL.revokeObjectURL(previewUrl); }, { once: true });
     $("#hangout-form").addEventListener("submit", (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
@@ -1153,20 +1201,24 @@
         save();
         location.hash = `#/h/${nh.id}`;
         toast("Hangout created");
+        if (pendingCover) setCover(nh.id, pendingCover);
       } else {
         // Growing a hangout turns on the tools that size starts with; shrinking never hides anything.
         const grew = size > h.size;
         Object.assign(h, data);
         if (grew) SIZES.find((s) => s.id === size).modules.forEach((m) => { if (!h.modules.includes(m)) h.modules.push(m); });
+        if (dropCover && !pendingCover) removeCover(h);
         closeDialog();
         commit();
         toast(grew ? "Saved. Added tools for a bigger hangout" : "Saved");
+        if (pendingCover) setCover(h.id, pendingCover);
       }
     });
   }
 
   function openRenameDialog(f) {
     const dlg = $("#dialog");
+    dlg.dataset.kind = "rename";
     dlg.innerHTML = `<form method="dialog" id="rename-form"><h2>Rename</h2>
       <label class="field"><span>Name</span><input class="input" id="f-rename" name="name" required value="${esc(f.name)}"></label>
       <div class="dialog-actions"><button type="button" class="btn" data-action="close-dialog">Cancel</button><button class="btn btn-primary">Save</button></div></form>`;
@@ -1221,17 +1273,14 @@
       case "account": openAccountDialog(); break;
       case "sign-out": closeDialog(); signOut(); toast("Signed out"); break;
       case "reload": location.reload(); break;
-      case "open-photo": openViewer(h.id, Number(btn.dataset.i)); break;
-      case "close-photo": closeViewer(); break;
-      case "photo-prev": stepViewer(-1); break;
-      case "photo-next": stepViewer(1); break;
-      case "delete-photo": confirmDeletePhoto(); break;
+      case "remove-cover": removeCover(h); commit(); toast("Cover photo removed"); break;
+      case "remove-profile-pic": removeProfilePicture(); break;
       case "new-hangout": openHangoutDialog(null); break;
       case "edit-hangout": openHangoutDialog(h); break;
       case "close-dialog": closeDialog(); break;
       case "filter": filter = btn.dataset.v; render(); break;
       case "clear-examples":
-        deletePhotosOf(state.hangouts);
+        deleteCoversOf(state.hangouts);
         state = { friends: [friend(state.meId) || { id: uid(), name: "You", color: COLORS[0] }], hangouts: [], currency: state.currency, examples: false };
         state.meId = state.friends[0].id;
         commit(); toast("Examples cleared"); break;
@@ -1272,7 +1321,18 @@
         copy.guests.forEach((g) => { g.rsvp = "pending"; });
         [...copy.tasks, ...copy.bring].forEach((t) => { t.done = false; });
         copy.expenses = [];
-        copy.photos = [];
+        copy.cover = null;
+        if (h.cover) {
+          // Give the copy its own cover image so deleting one never breaks the other.
+          loadPhoto(h.cover.id).then(async (src) => {
+            if (!src) return;
+            const id = uid();
+            await photoStore.put(id, src, "cover");
+            photoCache.set(id, src);
+            const target = hangout(copy.id);
+            if (target && !target.cover) { target.cover = { id }; commit(); } else photoStore.del(id);
+          }).catch(() => { /* copy keeps no cover */ });
+        }
         if (copy.poll) copy.poll.options.forEach((o) => { o.votes = []; });
         state.hangouts.push(copy);
         save(); location.hash = `#/h/${copy.id}`; toast("Copied. Pick a new date");
@@ -1280,7 +1340,7 @@
       }
       case "delete-hangout":
         confirmInline(`Delete “${h.title}”? This can't be undone.`, "Delete hangout", () => {
-          deletePhotosOf([h]);
+          deleteCoversOf([h]);
           state.hangouts = state.hangouts.filter((x) => x.id !== h.id);
           save(); location.hash = "#/"; toast("Hangout deleted");
         });
@@ -1303,7 +1363,7 @@
       }
       case "reset-all":
         confirmInline(`Erase every hangout and friend ${cloud ? "in your account" : "in this browser"}?`, "Erase everything", () => {
-          deletePhotosOf(state.hangouts);
+          deleteCoversOf(state.hangouts);
           if (!cloud) { try { localStorage.removeItem(STORE_KEY); } catch (_) { /* ignore */ } }
           const me = friend(state.meId);
           state = { friends: [me ? { ...me } : { id: uid(), name: "You", color: COLORS[0] }], hangouts: [], currency: state.currency, examples: false };
@@ -1389,8 +1449,11 @@
       h.budget = Math.max(0, Number(el.value) || 0); commit();
     } else if (el.dataset.field === "currency") {
       state.currency = el.value.trim() || "$"; commit();
-    } else if (el.id === "photo-input" && el.files.length && h) {
-      addPhotos(h.id, [...el.files]);
+    } else if (el.dataset.upload === "cover" && el.files[0] && h) {
+      setCover(h.id, el.files[0]);
+      el.value = "";
+    } else if (el.dataset.upload === "profile" && el.files[0]) {
+      setProfilePicture(el.files[0]);
       el.value = "";
     } else if (el.id === "import-file" && el.files[0]) {
       const reader = new FileReader();
@@ -1417,24 +1480,8 @@
     }
   });
 
-  const lightbox = $("#lightbox");
-  lightbox.addEventListener("close", () => { viewer = null; });
-  lightbox.addEventListener("click", (e) => { if (e.target === lightbox || e.target.classList.contains("lb-stage")) closeViewer(); });
-  document.addEventListener("keydown", (e) => {
-    if (!viewer) return;
-    if (e.key === "ArrowLeft") stepViewer(-1);
-    else if (e.key === "ArrowRight") stepViewer(1);
-  });
-  let touchX = null;
-  lightbox.addEventListener("touchstart", (e) => { touchX = e.touches.length === 1 ? e.touches[0].clientX : null; }, { passive: true });
-  lightbox.addEventListener("touchend", (e) => {
-    if (touchX === null || !viewer) return;
-    const dx = e.changedTouches[0].clientX - touchX;
-    touchX = null;
-    if (Math.abs(dx) > 50) stepViewer(dx < 0 ? 1 : -1);
-  });
-
   window.addEventListener("hashchange", route);
+  if (state && retireGallery(state)) save();
   if (cloud) startCloud();
   route();
 })();
