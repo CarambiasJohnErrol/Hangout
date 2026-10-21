@@ -1,10 +1,12 @@
 rules_version = '2';
 
-// users/<uid>                 one account's hangouts (owner only)
-// users/<uid>/photos/<id>     that account's profile and cover pictures (owner only)
-// shares/<id>                 a shared copy of one hangout, behind a short link:
-//                             any signed-in user with the link can read it,
-//                             only the person who shared it can change it
+// users/<uid>               one account's hangouts (owner only)
+// users/<uid>/photos/<id>   that account's profile and cover pictures (owner only)
+// shares/<id>               a shared hangout behind an invite link:
+//   - any signed-in person with the link can read it and join as a viewer
+//   - each member can change only their own entry (name, RSVP), never their role
+//   - editors (listed in `editors`) can change the plan, not members or roles
+//   - only the owner (`createdBy`) can change roles, remove people, or delete it
 service cloud.firestore {
   match /databases/{database}/documents {
     match /users/{uid} {
@@ -19,11 +21,40 @@ service cloud.firestore {
     }
 
     match /shares/{shareId} {
-      allow get: if request.auth != null;
-      allow create: if request.auth != null && request.resource.data.createdBy == request.auth.uid;
-      allow update: if request.auth != null && resource.data.createdBy == request.auth.uid
-        && request.resource.data.createdBy == request.auth.uid;
-      allow delete: if request.auth != null && resource.data.createdBy == request.auth.uid;
+      function signedIn() { return request.auth != null; }
+      function me() { return request.auth.uid; }
+      function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+      function oldMembers() { return resource.data.get('members', {}); }
+      function newMembers() { return request.resource.data.get('members', {}); }
+
+      allow get: if signedIn();
+
+      allow create: if signedIn() && request.resource.data.createdBy == me();
+
+      // The owner can change anything except who owns it.
+      allow update: if signedIn() && resource.data.createdBy == me()
+        && request.resource.data.createdBy == resource.data.createdBy;
+
+      // Editors (who are still members) can change the plan.
+      allow update: if signedIn() && me() in resource.data.get('editors', []) && me() in oldMembers()
+        && changed().hasOnly(['hangout', 'friends', 'updatedBy', 'updatedAt'])
+        && request.resource.data.updatedBy == me();
+
+      // Anyone with the link can join, update their own entry, or leave.
+      // A new member is always a viewer; nobody can change their own role.
+      allow update: if signedIn()
+        && changed().hasOnly(['members'])
+        && newMembers().diff(oldMembers()).affectedKeys().hasOnly([me()])
+        && (
+          !(me() in newMembers())
+          || (
+            newMembers()[me()].keys().hasOnly(['name', 'rsvp', 'role', 'joinedAt'])
+            && newMembers()[me()].rsvp in ['pending', 'going', 'maybe', 'no']
+            && newMembers()[me()].role == oldMembers().get(me(), {'role': 'viewer'}).get('role', 'viewer')
+          )
+        );
+
+      allow delete: if signedIn() && resource.data.createdBy == me();
     }
   }
 }

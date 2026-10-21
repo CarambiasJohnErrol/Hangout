@@ -643,3 +643,32 @@ select.who { cursor: pointer; padding-right: 4px; }
 .each-pays > div { display: flex; flex-direction: column; gap: 2px; }
 .each-pays b.num { font-family: var(--font-display); font-size: 1.6rem; line-height: 1.1; color: var(--accent); }
 .paid-by { display: inline-flex; align-items: center; gap: 6px; }
+
+/* ---------- Shared hangouts ---------- */
+.shared-chip {
+  font-size: .7rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--accent); background: var(--accent-soft); border-radius: 999px; padding: 2px 8px; white-space: nowrap;
+}
+.share-note {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap;
+  background: var(--accent-soft); border-radius: var(--r-sm); padding: 8px 8px 8px 14px; font-size: .92rem; margin-bottom: 14px;
+}
+.guest-name { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; overflow-wrap: anywhere; }
+.guest-tags { display: flex; gap: 4px; flex-wrap: wrap; }
+.tag {
+  font-size: .7rem; font-weight: 700; border-radius: 999px; padding: 1px 8px; border: 1px solid var(--line);
+  color: var(--muted); background: var(--surface); white-space: nowrap;
+}
+button.tag.perm { cursor: pointer; }
+button.tag.perm:hover { border-color: var(--accent); color: var(--ink); }
+button.tag.perm[aria-pressed="true"] { background: var(--good-soft); color: var(--good); border-color: transparent; }
+.rsvp.locked button { cursor: default; }
+.rsvp.locked button:not([aria-pressed="true"]) { opacity: .55; }
+
+/* View-only guests: the plan is visible, only their own RSVP is interactive */
+.readonly .module form, .readonly [data-action^="remove"], .readonly [data-action="reset-poll"],
+.readonly .budget-grid, .readonly .split-pick { display: none !important; }
+.readonly select, .readonly .check, .readonly .voter, .readonly textarea { pointer-events: none; }
+.readonly select { appearance: none; -webkit-appearance: none; background: transparent; padding-right: 8px; }
+.readonly textarea { background: transparent; border-style: dashed; }
+.readonly .hero-actions .btn { grid-column: span 3; }

@@ -152,10 +152,11 @@
   function pushToCloud() {
     clearTimeout(saveTimer);
     if (!user || !state) return Promise.resolve();
+    [...state.hangouts.filter((h) => h.shareId), ...joinedHangouts.filter(canEdit)]
+      .forEach((h) => writeShare(h).catch(() => { /* retried on the next save */ }));
     const json = stableJSON(state);
     if (json === lastSynced) return Promise.resolve();
     lastSynced = json;
-    state.hangouts.filter((h) => h.shareId).forEach((h) => writeShare(h).catch(() => { /* retried on the next save */ }));
     return db.collection("users").doc(user.uid)
       .set({ state: JSON.parse(json), updatedAt: firebase.firestore.FieldValue.serverTimestamp() })
       .catch(() => { lastSynced = ""; toast("Couldn't save. Check your connection"); });
@@ -173,6 +174,7 @@
     auth.onAuthStateChanged((u) => {
       authReady = true;
       if (unsubDoc) { unsubDoc(); unsubDoc = null; }
+      resetSharing();
       user = u; state = null; lastSynced = ""; creating = false; loadError = "";
       authMode = "signin";
       render();
@@ -434,9 +436,9 @@
 
   const $ = (sel, root = document) => root.querySelector(sel);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const friend = (id) => state.friends.find((f) => f.id === id);
-  const fname = (id) => friend(id)?.name || "Someone";
-  const hangout = (id) => state.hangouts.find((h) => h.id === id);
+  const friend = (id) => state.friends.find((f) => f.id === id) || sharedPeople.get(id);
+  const fname = (id) => (id === EVERYONE ? "Everyone" : friend(id)?.name || "Someone");
+  const hangout = (id) => state.hangouts.find((h) => h.id === id) || joinedHangouts.find((h) => h.id === id);
   const initials = (name) => name.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join("") || "?";
   const money = (n) => {
     const v = Math.round(n * 100) / 100;
@@ -517,58 +519,240 @@
 
   // ---------- sharing ----------
 
-  // What a shared copy contains: the hangout (without pictures or its share id)
-  // and the friends it mentions (without profile pictures).
+  // ---------- shared hangouts ----------
+  // A shared hangout lives in Firestore at shares/<id>, one live copy for everyone:
+  //   hangout, friends    the plan and the people it mentions (owner and editors write)
+  //   members             {<uid>: {name, rsvp, role}}: people who joined with the link;
+  //                       each writes only their own entry, only the owner sets roles
+  //   editors             uids allowed to change the plan (kept in step with roles)
+  // The owner's own copy stays in their account; their app links each member as a
+  // guest (friend id "u_<uid>") and mirrors member RSVPs into the plan.
+  // Without accounts, the whole hangout is packed into the link instead (#/import/...).
+
+  const EVERYONE = "*";
+  const joinedHangouts = [];          // hangouts others shared with me, live
+  const sharedPeople = new Map();     // friend id -> person, from shared copies and members
+  const shareMeta = new Map();        // share id -> {createdBy, ownerName, members, editors}
+  const shareSubs = new Map();        // share id -> unsubscribe
+  const sharesSent = new Map();       // share id -> last payload written this session
+  let pendingShareId = null, shareLoading = false, pendingJoin = null;
+
+  const shareIdOf = (h) => h.shareId || h._shareId || null;
+  const metaOf = (h) => shareMeta.get(shareIdOf(h)) || null;
+  const isJoined = (h) => !!h?._shareId;
+  const roleIn = (h) => (!isJoined(h) ? "owner" : metaOf(h)?.members?.[user?.uid]?.role === "editor" ? "editor" : "viewer");
+  const canEdit = (h) => roleIn(h) !== "viewer";
+  const memberFid = (uidv) => `u_${uidv}`;
+  const colorFor = (str) => COLORS[[...str].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % COLORS.length];
+  const myName = () => user?.displayName || friend(state?.meId)?.name || (user?.email || "").split("@")[0] || "Friend";
+  const shareRef = (sid) => db.collection("shares").doc(sid);
+  const FV = () => firebase.firestore.FieldValue;
+
+  // What the shared copy holds: the plan (no cover, no local fields) and the people it mentions.
   function sharePayload(h) {
     const ids = new Set([
       ...h.guests.map((g) => g.friendId), ...h.bring.map((b) => b.friendId), ...h.tasks.map((t) => t.friendId),
       ...h.expenses.flatMap((e) => [e.paidBy, ...e.split]), ...(h.poll?.options || []).flatMap((o) => o.votes),
-    ].filter(Boolean));
-    const { cover, shareId, ...rest } = h;
+    ].filter((x) => x && x !== EVERYONE));
+    const { cover, shareId, _shareId, ...rest } = h;
     return JSON.parse(JSON.stringify({
       v: 1, hangout: { ...rest, cover: null },
-      friends: state.friends.filter((f) => ids.has(f.id)).map(({ photoId, ...f }) => f),
+      friends: [...ids].map((x) => friend(x)).filter(Boolean).map(({ photoId, ...f }) => f),
     }));
   }
 
-  // Signed in, a share link is short (#/s/<id>): the copy is kept in Firestore at
-  // shares/<id> and refreshed whenever the hangout changes. Without accounts the
-  // whole hangout is packed into the link itself (#/import/...).
-  const SHARE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
-  const newShareId = () => Array.from(crypto.getRandomValues(new Uint8Array(10)), (b) => SHARE_CHARS[b % SHARE_CHARS.length]).join("");
-  const sharesSent = new Map(); // hangout id -> last payload written this session
-
   function writeShare(h) {
+    const sid = shareIdOf(h);
     const payload = sharePayload(h);
     const json = stableJSON(payload);
-    if (sharesSent.get(h.id) === json) return Promise.resolve();
-    sharesSent.set(h.id, json);
-    return db.collection("shares").doc(h.shareId)
-      .set({ ...payload, createdBy: user.uid, updatedAt: firebase.firestore.FieldValue.serverTimestamp() })
-      .catch((e) => { sharesSent.delete(h.id); throw e; });
+    if (sharesSent.get(sid) === json) return Promise.resolve();
+    sharesSent.set(sid, json);
+    const fields = { hangout: payload.hangout, friends: payload.friends, updatedBy: user.uid, updatedAt: FV().serverTimestamp() };
+    const ref = shareRef(sid);
+    const write = isJoined(h)
+      ? ref.update(fields)
+      : ref.update({ ...fields, ownerName: myName() }).catch((e) => {
+          // The first write creates the shared copy. Updating a copy that doesn't exist
+          // yet is refused by the rules (permission-denied), not reported as not-found.
+          if (e && (e.code === "not-found" || e.code === "permission-denied")) {
+            return ref.set({ ...fields, ownerName: myName(), createdBy: user.uid, members: {}, editors: [] });
+          }
+          throw e;
+        });
+    return write.catch((e) => { sharesSent.delete(sid); throw e; });
   }
 
   function shareLink(h) {
     const base = `${location.origin}${location.pathname}`;
     if (!cloud || !user) return `${base}#/import/${encodeShare(h)}`;
+    if (isJoined(h)) return `${base}#/s/${h._shareId}`;
     if (!h.shareId) { h.shareId = newShareId(); save(); }
     writeShare(h).catch(() => toast("Couldn't create the share link. Check your connection and try again"));
+    syncShareSubs();
     return `${base}#/s/${h.shareId}`;
   }
 
-  let pendingShareId = null, shareLoading = false;
+  const SHARE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+  const newShareId = () => Array.from(crypto.getRandomValues(new Uint8Array(10)), (b) => SHARE_CHARS[b % SHARE_CHARS.length]).join("");
+
+  function resetSharing() {
+    shareSubs.forEach((unsub) => unsub());
+    shareSubs.clear(); shareMeta.clear(); sharedPeople.clear(); sharesSent.clear();
+    joinedHangouts.length = 0;
+    pendingJoin = null;
+  }
+
+  // Subscribe to every shared copy this account owns or has joined.
+  function syncShareSubs() {
+    if (!cloud || !user || !state) return;
+    const want = new Set([...state.hangouts.filter((h) => h.shareId).map((h) => h.shareId), ...(state.joined || [])]);
+    shareSubs.forEach((unsub, sid) => {
+      if (want.has(sid)) return;
+      unsub(); shareSubs.delete(sid); shareMeta.delete(sid);
+      const i = joinedHangouts.findIndex((h) => h._shareId === sid);
+      if (i >= 0) joinedHangouts.splice(i, 1);
+    });
+    want.forEach((sid) => {
+      if (!shareSubs.has(sid)) shareSubs.set(sid, shareRef(sid).onSnapshot((snap) => onShareSnap(sid, snap), () => { /* keeps the last copy */ }));
+    });
+  }
+
+  function onShareSnap(sid, snap) {
+    if (snap.metadata.hasPendingWrites) return;
+    const own = state?.hangouts.find((h) => h.shareId === sid);
+    if (!snap.exists) {
+      shareMeta.set(sid, { members: {}, editors: [] });
+      if (!own && (state.joined || []).includes(sid)) {
+        const gone = joinedHangouts.find((h) => h._shareId === sid);
+        state.joined = state.joined.filter((x) => x !== sid);
+        save();
+        toast(`${gone ? `“${gone.title}”` : "A hangout shared with you"} was deleted by its owner`);
+      }
+      render();
+      return;
+    }
+    const d = snap.data();
+    const members = d.members || {};
+    shareMeta.set(sid, { createdBy: d.createdBy, ownerName: d.ownerName || "", members, editors: d.editors || [] });
+    (d.friends || []).forEach((f) => { if (!state.friends.some((x) => x.id === f.id)) sharedPeople.set(f.id, f); });
+    Object.entries(members).forEach(([m, info]) => {
+      sharedPeople.set(memberFid(m), { id: memberFid(m), name: info.name || "Friend", color: colorFor(m), uid: m });
+    });
+
+    if (own) {
+      // Owner: take in editors' changes, add new members as guests, mirror their RSVPs.
+      let changed = false;
+      const remote = d.hangout && stableJSON({ v: 1, hangout: d.hangout, friends: d.friends || [] });
+      if (d.updatedBy && d.updatedBy !== user.uid && remote && remote !== sharesSent.get(sid)) {
+        const keep = { cover: own.cover || null, shareId: own.shareId };
+        Object.keys(own).forEach((k) => delete own[k]);
+        Object.assign(own, JSON.parse(JSON.stringify(d.hangout)), keep);
+        (d.friends || []).forEach((f) => { if (!state.friends.some((x) => x.id === f.id)) state.friends.push({ ...f }); });
+        sharesSent.set(sid, remote);
+        changed = true;
+      }
+      Object.entries(members).forEach(([m, info]) => {
+        // Link the account to a guest already on the list with the same name, if there is one.
+        const sameName = (x) => !x.uid && (x.name || "").trim().toLowerCase() === (info.name || "").trim().toLowerCase();
+        let f = state.friends.find((x) => x.uid === m)
+          || own.guests.map((g2) => state.friends.find((x) => x.id === g2.friendId)).find((x) => x && sameName(x));
+        if (f && !f.uid) { f.uid = m; changed = true; }
+        if (!f) { f = { id: memberFid(m), name: info.name || "Friend", color: colorFor(m), uid: m }; state.friends.push(f); changed = true; }
+        else if (info.name && f.name !== info.name) { f.name = info.name; changed = true; }
+        const fid = f.id;
+        const g = own.guests.find((x) => x.friendId === fid);
+        if (!g) { own.guests.push({ friendId: fid, rsvp: info.rsvp || "pending" }); changed = true; }
+        else if (info.rsvp && g.rsvp !== info.rsvp) { g.rsvp = info.rsvp; changed = true; }
+      });
+      if (changed) save();
+    } else if ((state.joined || []).includes(sid)) {
+      if (!members[user.uid]) {
+        state.joined = state.joined.filter((x) => x !== sid);
+        const i = joinedHangouts.findIndex((h) => h._shareId === sid);
+        if (i >= 0) joinedHangouts.splice(i, 1);
+        save();
+        toast(`You're no longer a guest of “${d.hangout?.title || "a hangout"}”`);
+        render();
+        return;
+      }
+      const h = JSON.parse(JSON.stringify(d.hangout));
+      h._shareId = sid;
+      h.cover = null;
+      h.guests.forEach((g) => { const m = friend(g.friendId)?.uid; if (m && members[m]?.rsvp) g.rsvp = members[m].rsvp; });
+      sharesSent.set(sid, stableJSON(sharePayload(h)));
+      const i = joinedHangouts.findIndex((x) => x._shareId === sid);
+      if (i >= 0) joinedHangouts[i] = h; else joinedHangouts.push(h);
+    }
+    render();
+  }
+
+  // Someone opened a short link: look the hangout up, then offer to join.
   function resolveShare() {
-    const id = pendingShareId;
+    const sid = pendingShareId;
     shareLoading = true;
-    db.collection("shares").doc(id).get()
+    shareRef(sid).get()
       .then((snap) => {
-        const data = snap.exists ? snap.data() : null;
-        if (!data || !data.hangout) { toast("That share link doesn't work anymore. Ask for a new one"); return; }
-        if (data.createdBy === user.uid && hangout(data.hangout.id)) { location.hash = `#/h/${data.hangout.id}`; return; }
-        pendingImport = data;
+        const d = snap.exists ? snap.data() : null;
+        if (!d || !d.hangout) { toast("That invite link doesn't work anymore. Ask for a new one"); return; }
+        if (d.createdBy === user.uid) { location.hash = `#/h/${d.hangout.id}`; return; }
+        if (d.members && d.members[user.uid]) {
+          if (!(state.joined || []).includes(sid)) { state.joined = [...(state.joined || []), sid]; save(); }
+          location.hash = `#/h/${d.hangout.id}`;
+          return;
+        }
+        pendingJoin = { sid, title: d.hangout.title, owner: d.ownerName || "A friend", hangoutId: d.hangout.id };
       })
-      .catch(() => toast("Couldn't open the shared hangout. Check your connection and reload"))
+      .catch(() => toast("Couldn't open the invite. Check your connection and reload"))
       .finally(() => { pendingShareId = null; shareLoading = false; render(); });
+  }
+
+  function joinShare() {
+    const { sid, title, hangoutId } = pendingJoin;
+    pendingJoin = null;
+    shareRef(sid).update({ [`members.${user.uid}`]: { name: myName(), rsvp: "pending", role: "viewer", joinedAt: Date.now() } })
+      .then(() => {
+        state.joined = [...new Set([...(state.joined || []), sid])];
+        save();
+        syncShareSubs();
+        location.hash = `#/h/${hangoutId}`;
+        toast(`You joined “${title}”. Let them know if you're going`);
+      })
+      .catch(() => { toast("Couldn't join. Check your connection and try again"); render(); });
+  }
+
+  function leaveShare(h) {
+    const sid = h._shareId;
+    shareRef(sid).update({ [`members.${user.uid}`]: FV().delete() })
+      .then(() => {
+        state.joined = (state.joined || []).filter((x) => x !== sid);
+        const i = joinedHangouts.findIndex((x) => x._shareId === sid);
+        if (i >= 0) joinedHangouts.splice(i, 1);
+        save();
+        location.hash = "#/";
+        toast(`You left “${h.title}”`);
+      })
+      .catch(() => toast("Couldn't leave. Check your connection and try again"));
+  }
+
+  // A member's own RSVP (or the owner answering for them) lives in their member entry.
+  function setMemberRsvp(h, memberUid, rsvp) {
+    return shareRef(shareIdOf(h)).update({ [`members.${memberUid}.rsvp`]: rsvp })
+      .catch(() => toast("Couldn't save the RSVP. Check your connection"));
+  }
+
+  const memberName = (memberUid) => state.friends.find((x) => x.uid === memberUid)?.name || fname(memberFid(memberUid));
+
+  function setEditor(h, memberUid, on) {
+    return shareRef(h.shareId).update({
+      [`members.${memberUid}.role`]: on ? "editor" : "viewer",
+      editors: on ? FV().arrayUnion(memberUid) : FV().arrayRemove(memberUid),
+    }).then(() => toast(on ? `${memberName(memberUid)} can now edit this hangout` : `${memberName(memberUid)} can view only`))
+      .catch(() => toast("Couldn't change the permission. Check your connection"));
+  }
+
+  function removeMember(h, memberUid) {
+    return shareRef(h.shareId).update({ [`members.${memberUid}`]: FV().delete(), editors: FV().arrayRemove(memberUid) })
+      .catch(() => { /* they stay a member until the next try */ });
   }
 
   function encodeShare(h) {
@@ -669,7 +853,7 @@
   let query = "";
 
   function renderHome() {
-    const all = [...state.hangouts];
+    const all = [...state.hangouts, ...joinedHangouts];
     const upcoming = all.filter((h) => !isPast(h) && h.date).sort((a, b) => parseDate(a) - parseDate(b));
     const tbd = all.filter((h) => !h.date).sort((a, b) => b.createdAt - a.createdAt);
     const past = all.filter((h) => isPast(h)).sort((a, b) => parseDate(b) - parseDate(a));
@@ -729,7 +913,7 @@
         <div class="card-top">
           <div class="datebox ${d ? "" : "tbd"}">${d ? `<span>${d.toLocaleDateString(undefined, { month: "short" })}</span><b>${d.getDate()}</b>` : "<b>TBD</b>"}</div>
           <div class="card-title">
-            ${sizePill(h.size)}
+            <span class="row" style="gap:8px">${sizePill(h.size)}${isJoined(h) ? `<span class="shared-chip">Shared by ${esc(metaOf(h)?.ownerName || "a friend")}</span>` : h.shareId && Object.keys(metaOf(h)?.members || {}).length ? `<span class="shared-chip">Shared</span>` : ""}</span>
             <h3>${esc(h.title)}</h3>
             <div class="meta">${d ? `<span>${esc(fmtWhen(h))}</span>` : ""}${h.place ? `<span>${esc(h.place)}</span>` : ""}</div>
           </div>
@@ -760,8 +944,13 @@
   }
 
   function renderHangout(h) {
+    ctxHangout = h;
+    const role = roleIn(h);
     const counts = { going: 0, maybe: 0, no: 0, pending: 0 };
-    h.guests.forEach((g) => { counts[g.rsvp] = (counts[g.rsvp] || 0) + 1; });
+    const linkedUids = new Set(h.guests.map((g) => friend(g.friendId)?.uid).filter(Boolean));
+    const extraMembers = Object.entries(metaOf(h)?.members || {}).filter(([m]) => !linkedUids.has(m));
+    [...h.guests, ...extraMembers.map(([, info]) => ({ rsvp: info.rsvp || "pending" }))].forEach((g) => { counts[g.rsvp] = (counts[g.rsvp] || 0) + 1; });
+    const invitedCount = h.guests.length + extraMembers.length;
     const tasksDone = h.tasks.filter((t) => t.done).length;
     const bringCovered = h.bring.filter((b) => b.friendId).length;
     const each = perPerson(h);
@@ -771,7 +960,7 @@
     const missing = Object.keys(MODULES).filter((m) => !has(m));
 
     const stats = [
-      `<div class="stat"><span>Going</span><b>${counts.going}<small> of ${h.guests.length}</small></b></div>`,
+      `<div class="stat"><span>Going</span><b>${counts.going}<small> of ${invitedCount}</small></b></div>`,
       n !== null && n >= 0 ? `<div class="stat"><span>Countdown</span><b>${n === 0 ? "Today" : n === 1 ? "Tomorrow" : `${n} days`}</b></div>` : "",
       has("tasks") && h.tasks.length ? `<div class="stat"><span>To-dos done</span><b>${tasksDone}/${h.tasks.length}</b><div class="bar"><i style="width:${(tasksDone / h.tasks.length) * 100}%"></i></div></div>` : "",
       has("bring") && h.bring.length ? `<div class="stat"><span>Items covered</span><b>${bringCovered}/${h.bring.length}</b><div class="bar"><i style="width:${(bringCovered / h.bring.length) * 100}%"></i></div></div>` : "",
@@ -780,21 +969,27 @@
     ].join("");
 
     const order = ["guests", "tasks", "bring", "schedule", "budget", "split", "poll", "notes"];
+    const meta = metaOf(h);
+    const sharedNote = isJoined(h)
+      ? `<div class="share-note"><span>Shared by <b>${esc(meta?.ownerName || "a friend")}</b> · ${role === "editor" ? "You can edit" : "View only"}</span><button class="btn btn-sm btn-ghost btn-danger" data-action="leave-hangout">Leave</button></div>`
+      : "";
     return `
       <a href="#/" class="back">← All hangouts</a>
+      <div class="${role === "viewer" ? "readonly" : ""}" data-role="${role}">
+      ${sharedNote}
       <section class="hero ${h.cover ? "has-cover" : ""}">
-        ${coverHTML(h)}
+        ${isJoined(h) ? "" : coverHTML(h)}
         <div class="hero-top">
           <div class="hero-title">
             ${sizePill(h.size)}
             <h1>${esc(h.title)}</h1>
           </div>
           <div class="hero-actions">
-            <button class="btn btn-sm" data-action="edit-hangout">Edit</button>
+            ${role !== "viewer" ? `<button class="btn btn-sm" data-action="edit-hangout">Edit</button>` : ""}
             <button class="btn btn-sm" data-action="copy-invite">Copy invite</button>
-            <button class="btn btn-sm" data-action="share-link">Share link</button>
-            <button class="btn btn-sm btn-ghost" data-action="duplicate">Duplicate</button>
-            <button class="btn btn-sm btn-ghost btn-danger" data-action="delete-hangout">Delete</button>
+            <button class="btn btn-sm" data-action="share-link">${cloud ? "Invite link" : "Share link"}</button>
+            ${isJoined(h) ? "" : `<button class="btn btn-sm btn-ghost" data-action="duplicate">Duplicate</button>
+            <button class="btn btn-sm btn-ghost btn-danger" data-action="delete-hangout">Delete</button>`}
           </div>
         </div>
         <div class="facts">
@@ -808,14 +1003,21 @@
       <div class="modules">
         ${order.filter(has).map((m) => moduleHTML(m, h)).join("")}
       </div>
-      ${missing.length ? `<div class="add-modules"><span class="muted small">Add a section:</span>${missing.map((m) => `<button class="chip" data-action="add-module" data-v="${m}">+ ${esc(MODULES[m])}</button>`).join("")}</div>` : ""}
+      ${missing.length && role !== "viewer" ? `<div class="add-modules"><span class="muted small">Add a section:</span>${missing.map((m) => `<button class="chip" data-action="add-module" data-v="${m}">+ ${esc(MODULES[m])}</button>`).join("")}</div>` : ""}
+      </div>
     `;
   }
 
-  function friendSelect(name, selected = "", { blank = "Anyone", guestsOnly = null } = {}) {
-    const pool = guestsOnly ? state.friends.filter((f) => guestsOnly.includes(f.id)) : state.friends;
+  let ctxHangout = null; // the hangout being rendered, for person pickers
+
+  function friendSelect(name, selected = "", { blank = "Anyone", everyone = false } = {}) {
+    const h = ctxHangout;
+    const pool = h && isJoined(h)
+      ? h.guests.map((g) => friend(g.friendId)).filter(Boolean)
+      : state.friends;
     return `<select class="select who" name="${name}" data-field="${name}" aria-label="Person">
       <option value="">${esc(blank)}</option>
+      ${everyone ? `<option value="${EVERYONE}" ${selected === EVERYONE ? "selected" : ""}>Everyone</option>` : ""}
       ${pool.map((f) => `<option value="${esc(f.id)}" ${f.id === selected ? "selected" : ""}>${esc(f.name)}</option>`).join("")}
     </select>`;
   }
@@ -830,23 +1032,43 @@
   function moduleHTML(m, h) {
     const guestIds = h.guests.map((g) => g.friendId);
     if (m === "guests") {
-      const notInvited = state.friends.filter((f) => !guestIds.includes(f.id));
+      const meta = metaOf(h);
+      const members = meta?.members || {};
+      const owner = roleIn(h) === "owner";
+      const editable = canEdit(h);
+      const notInvited = isJoined(h) ? [] : state.friends.filter((f) => !guestIds.includes(f.id));
+      // Members the owner's app hasn't added as guests yet still show up.
+      const linked = new Set(h.guests.map((g) => friend(g.friendId)?.uid).filter(Boolean));
+      const rows = [...h.guests, ...Object.keys(members).filter((x) => !linked.has(x)).map((x) => ({ friendId: memberFid(x), rsvp: members[x].rsvp || "pending" }))];
       const order = { going: 0, maybe: 1, pending: 2, no: 3 };
-      const sorted = [...h.guests].sort((a, b) => order[a.rsvp] - order[b.rsvp] || fname(a.friendId).localeCompare(fname(b.friendId)));
+      rows.sort((a, b) => order[a.rsvp] - order[b.rsvp] || fname(a.friendId).localeCompare(fname(b.friendId)));
+      const goingCount = rows.filter((g) => g.rsvp === "going").length;
       return moduleShell(m, h, `
-        ${sorted.length ? `<ul class="list">${sorted.map((g) => `
-          <li data-id="${esc(g.friendId)}">${avatar(g.friendId)}<span class="grow">${esc(fname(g.friendId))}</span>
-            <span class="rsvp" role="group" aria-label="RSVP for ${esc(fname(g.friendId))}">
-              ${[["going", "Going"], ["maybe", "Maybe"], ["no", "Can't"]].map(([v, l]) => `<button data-action="rsvp" data-v="${v}" aria-pressed="${g.rsvp === v}">${l}</button>`).join("")}
+        ${rows.length ? `<ul class="list">${rows.map((g) => {
+          const account = friend(g.friendId)?.uid;
+          const member = account && members[account];
+          const mine = account && account === user?.uid;
+          const canAnswer = mine || (member ? owner : editable);
+          return `
+          <li data-id="${esc(g.friendId)}" class="${mine ? "mine" : ""}">${avatar(g.friendId)}
+            <span class="guest-name"><span>${esc(fname(g.friendId))}${mine ? ' <span class="muted small">(you)</span>' : ""}</span>
+              ${member ? `<span class="guest-tags"><span class="tag">Joined</span>${owner
+                ? `<button class="tag perm" data-action="toggle-editor" aria-pressed="${member.role === "editor"}" title="Allow ${esc(fname(g.friendId))} to edit this hangout">${member.role === "editor" ? "Can edit ✓" : "Can edit"}</button>`
+                : member.role === "editor" ? `<span class="tag">Can edit</span>` : ""}</span>` : ""}</span>
+            <span class="rsvp ${canAnswer ? "" : "locked"}" role="group" aria-label="RSVP for ${esc(fname(g.friendId))}">
+              ${[["going", "Going"], ["maybe", "Maybe"], ["no", "Can't"]].map(([v, l]) => `<button data-action="rsvp" data-v="${v}" aria-pressed="${g.rsvp === v}" ${canAnswer ? "" : "disabled"}>${l}</button>`).join("")}
             </span>
-            <button class="icon-btn" data-action="remove-guest" aria-label="Remove ${esc(fname(g.friendId))}">×</button>
-          </li>`).join("")}</ul>` : `<p class="muted small">No one invited yet.</p>`}
-        <form class="add-row add-row-inline" data-form="add-guest">
-          <input class="input" name="name" list="friend-names" placeholder="Invite someone by name" autocomplete="off" aria-label="Name to invite">
-          <button class="btn btn-sm">Invite</button>
-          ${notInvited.length ? `<button type="button" class="btn btn-sm btn-ghost" data-action="invite-all">Invite all friends</button>` : ""}
+            ${editable && (!member || owner) ? `<button class="icon-btn" data-action="remove-guest" aria-label="Remove ${esc(fname(g.friendId))}">×</button>` : `<span class="icon-btn" aria-hidden="true"></span>`}
+          </li>`;
+        }).join("")}</ul>` : `<p class="muted small">No one invited yet.</p>`}
+        ${editable ? `<form class="add-row add-row-inline" data-form="add-guest">
+          <input class="input" name="name" list="friend-names" placeholder="Add someone by name" autocomplete="off" aria-label="Name to add">
+          <button class="btn btn-sm">Add</button>
+          ${notInvited.length ? `<button type="button" class="btn btn-sm btn-ghost" data-action="invite-all">Add all friends</button>` : ""}
         </form>
-        <datalist id="friend-names">${notInvited.map((f) => `<option value="${esc(f.name)}"></option>`).join("")}</datalist>`, { sub: `${h.guests.filter((g) => g.rsvp === "going").length} going` });
+        <datalist id="friend-names">${notInvited.map((f) => `<option value="${esc(f.name)}"></option>`).join("")}</datalist>` : ""}
+        ${cloud && owner ? `<p class="muted small">Send your invite link so friends can join with their own account. They'll show up here, answer for themselves, and you can let them edit.</p>` : ""}`,
+        { sub: `${goingCount} going` });
     }
     if (m === "bring" || m === "tasks") {
       const items = h[m];
@@ -855,12 +1077,12 @@
           <li data-id="${esc(t.id)}" class="${t.done ? "done" : ""}">
             <input type="checkbox" class="check" data-action="toggle-item" data-list="${m}" ${t.done ? "checked" : ""} aria-label="Mark done">
             <span class="item-body"><span class="grow">${esc(t.text)}</span>
-            ${friendSelect("assign", t.friendId, { blank: m === "bring" ? "Needs someone" : "Unassigned" })}</span>
+            ${friendSelect("assign", t.friendId, { blank: m === "bring" ? "Needs someone" : "Unassigned", everyone: m === "bring" })}</span>
             <button class="icon-btn" data-action="remove-item" data-list="${m}" aria-label="Remove">×</button>
           </li>`).join("")}</ul>` : `<p class="muted small">${m === "bring" ? "List snacks, gear or anything people should bring." : "Bookings, shopping, anything that has to get done."}</p>`}
         <form class="add-row" data-form="add-item" data-list="${m}">
           <input class="input" name="text" placeholder="${m === "bring" ? "e.g. Chips and dip" : "e.g. Reserve a table"}" aria-label="New item" required>
-          ${friendSelect("friendId", "", { blank: m === "bring" ? "Needs someone" : "Unassigned" })}
+          ${friendSelect("friendId", "", { blank: m === "bring" ? "Needs someone" : "Unassigned", everyone: m === "bring" })}
           <button class="btn btn-sm">Add</button>
         </form>`, { sub: items.length ? `${items.filter((t) => t.done).length}/${items.length} done` : "" });
     }
@@ -1016,7 +1238,7 @@
           </div>`}
           <div class="auth-head"><h1>${heading}</h1><p class="muted">${sub}</p></div>
           ${pendingImport ? `<div class="banner info small">Sign in to add <b>${esc(pendingImport.hangout.title)}</b> to your hangouts.</div>`
-            : pendingShareId ? `<div class="banner info small">Someone shared a hangout with you. Sign in or create an account to see it.</div>` : ""}
+            : pendingShareId ? `<div class="banner info small">You've been invited to a hangout. Sign in or create an account to join it.</div>` : ""}
           <form class="auth-form" data-form="auth" novalidate>
             ${signup ? `<label class="field"><span>Your name</span><input class="input" id="auth-name" name="name" autocomplete="name" placeholder="What friends call you" required></label>` : ""}
             <label class="field"><span>Email</span><input class="input" id="auth-email" name="email" type="email" autocomplete="email" inputmode="email" required></label>
@@ -1196,18 +1418,25 @@
       document.title = "Hangout HQ";
       return;
     }
+    syncShareSubs();
     const hash = location.hash || "#/";
     let html, nav = "home";
     const m = hash.match(/^#\/h\/([\w-]+)/);
     if (m) {
       const h = hangout(m[1]);
-      html = h ? renderHangout(h) : `<div class="empty"><b>That hangout doesn't exist anymore.</b><a href="#/" class="btn">Back to hangouts</a></div>`;
+      const stillLoading = cloud && (state.joined || []).some((sid) => !shareMeta.has(sid));
+      html = h ? renderHangout(h)
+        : stillLoading ? `<div class="loading" role="status"><span class="spinner" aria-hidden="true"></span>Loading…</div>`
+        : `<div class="empty"><b>That hangout doesn't exist anymore.</b><a href="#/" class="btn">Back to hangouts</a></div>`;
     } else if (hash.startsWith("#/friends")) {
       html = renderFriends(); nav = "friends";
     } else {
       html = renderHome();
     }
     if (pendingShareId && !shareLoading) resolveShare();
+    if (pendingJoin) {
+      html = `<div class="banner info"><span><b>${esc(pendingJoin.owner)}</b> invited you to <b>${esc(pendingJoin.title)}</b>.</span><span class="row"><button class="btn btn-sm btn-primary" data-action="join-share">Join hangout</button><button class="btn btn-sm btn-ghost" data-action="dismiss-join">Not now</button></span></div>` + html;
+    }
     if (pendingImport) {
       html = `<div class="banner info"><span>Someone shared <b>${esc(pendingImport.hangout.title)}</b> with you.</span><span class="row"><button class="btn btn-sm btn-primary" data-action="accept-import">Add to my hangouts</button><button class="btn btn-sm btn-ghost" data-action="dismiss-import">Dismiss</button></span></div>` + html;
     }
@@ -1375,6 +1604,13 @@
     const li = btn.closest("[data-id]");
     const id = li?.dataset.id;
 
+    const PLAN_ACTIONS = ["edit-hangout", "remove-cover", "invite-all", "toggle-item", "remove-item", "remove-schedule",
+      "remove-expense", "remove-cost", "vote", "reset-poll", "add-module", "remove-module", "delete-hangout", "duplicate"];
+    if (h && PLAN_ACTIONS.includes(action)) {
+      if (!canEdit(h)) { toast("You can view this hangout. Ask the host if you want to edit it"); e.preventDefault(); render(); return; }
+      if (isJoined(h) && ["remove-cover", "delete-hangout", "duplicate"].includes(action)) return;
+    }
+
     switch (action) {
       case "auth-mode": authMode = btn.dataset.v; render(); $("#auth-email")?.focus(); break;
       case "toggle-pw": {
@@ -1401,11 +1637,42 @@
         state.meId = state.friends[0].id;
         commit(); toast("Examples cleared"); break;
       case "rsvp": {
+        const account = friend(id)?.uid;
+        const members = metaOf(h)?.members || {};
         const g = h.guests.find((x) => x.friendId === id);
-        g.rsvp = g.rsvp === btn.dataset.v ? "pending" : btn.dataset.v;
+        const current = g ? g.rsvp : members[account]?.rsvp;
+        const next = current === btn.dataset.v ? "pending" : btn.dataset.v;
+        if (account && members[account]) {
+          // Joined guests answer for themselves (the owner may answer for them).
+          if (account !== user.uid && roleIn(h) !== "owner") break;
+          setMemberRsvp(h, account, next);
+          if (g) g.rsvp = next;
+          if (isJoined(h)) render(); else commit();
+          break;
+        }
+        if (!canEdit(h) || !g) break;
+        g.rsvp = next;
         commit(); break;
       }
-      case "remove-guest": h.guests = h.guests.filter((g) => g.friendId !== id); commit(); break;
+      case "remove-guest": {
+        const account = friend(id)?.uid;
+        if (account && metaOf(h)?.members?.[account]) {
+          if (roleIn(h) !== "owner") break;
+          removeMember(h, account);
+        }
+        h.guests = h.guests.filter((g) => g.friendId !== id); commit(); break;
+      }
+      case "toggle-editor": {
+        const account = friend(id)?.uid;
+        const member = metaOf(h)?.members?.[account];
+        if (roleIn(h) === "owner" && member) setEditor(h, account, member.role !== "editor");
+        break;
+      }
+      case "leave-hangout":
+        confirmInline(`Leave “${h.title}”? It disappears from your hangouts until someone sends you the link again.`, "Leave hangout", () => leaveShare(h));
+        break;
+      case "join-share": joinShare(); break;
+      case "dismiss-join": pendingJoin = null; render(); break;
       case "invite-all":
         state.friends.forEach((f) => { if (!h.guests.some((g) => g.friendId === f.id)) h.guests.push({ friendId: f.id, rsvp: "pending" }); });
         commit(); break;
@@ -1429,7 +1696,7 @@
       case "copy-invite": toast((await copyText(inviteText(h))) ? "Invite copied. Paste it in your group chat" : "Couldn't copy. Try again"); break;
       case "share-link": {
         const url = shareLink(h);
-        toast((await copyText(url)) ? "Link copied. Friends can open it to add this hangout" : "Couldn't copy the link");
+        toast((await copyText(url)) ? cloud ? "Invite link copied. Friends who open it can join this hangout" : "Link copied. Friends can open it to add this hangout" : "Couldn't copy the link");
         break;
       }
       case "duplicate": {
@@ -1439,6 +1706,7 @@
         [...copy.tasks, ...copy.bring].forEach((t) => { t.done = false; });
         copy.expenses = [];
         copy.cover = null;
+        delete copy.shareId;
         if (h.cover) {
           // Give the copy its own cover image so deleting one never breaks the other.
           loadPhoto(h.cover.id).then(async (src) => {
@@ -1458,6 +1726,7 @@
       case "delete-hangout":
         confirmInline(`Delete “${h.title}”? This can't be undone.`, "Delete hangout", () => {
           deleteCoversOf([h]);
+          if (cloud && h.shareId) shareRef(h.shareId).delete().catch(() => { /* guests keep their last copy */ });
           state.hangouts = state.hangouts.filter((x) => x.id !== h.id);
           save(); location.hash = "#/"; toast("Hangout deleted");
         });
@@ -1507,6 +1776,7 @@
     if (form.dataset.form === "auth") { submitAuth(form); return; }
     const fd = new FormData(form);
     const h = currentHangout();
+    if (h && !canEdit(h)) return;
     switch (form.dataset.form) {
       case "add-guest": {
         const f = findOrCreateFriend(fd.get("name") || "");
@@ -1561,6 +1831,8 @@
   document.addEventListener("change", (e) => {
     const el = e.target;
     const h = currentHangout();
+    if (h && !canEdit(h) && (el.dataset.field || el.dataset.upload === "cover")) { render(); return; }
+    if (h && isJoined(h) && el.dataset.upload === "cover") return;
     if (el.dataset.field === "assign" && h) {
       const li = el.closest("[data-id]");
       const list = el.closest("[data-module]").dataset.module;
@@ -1598,6 +1870,7 @@
     if (el.id === "search") { query = el.value; render(); return; }
     if (el.dataset.field === "notes") {
       const h = currentHangout();
+      if (!h || !canEdit(h)) return;
       h.notes = el.value;
       clearTimeout(notesTimer);
       notesTimer = setTimeout(save, 400);

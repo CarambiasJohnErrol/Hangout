@@ -17,9 +17,14 @@ The size decides which planning tools you start with, and you can add or hide an
 - **Notes**
 - **Pictures**: a profile photo for you, and a cover photo for each hangout
 
-Share a hangout by copying a ready-to-paste invite for the group chat, or a short link
-(`…/#/s/<id>`) that lets a friend add the whole plan to their own Hangout HQ. The shared copy is
-kept at `shares/<id>` and updates whenever you change the hangout.
+Share a hangout by copying a ready-to-paste invite for the group chat, or an invite link
+(`…/#/s/<id>`). Friends who open it sign in and **join**: the hangout shows up in their list,
+they appear in your Guests and answer their own RSVP, and you can switch on **Can edit** for
+anyone you want to help plan. Everyone sees one live copy, kept at `shares/<id>`.
+
+`firestore.rules` enforces the permissions: anyone with the link can join as a viewer and change
+only their own entry; editors can change the plan; only the owner can change roles, remove
+people or delete the hangout.
 
 ## Running it
 
