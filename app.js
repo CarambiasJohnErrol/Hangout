@@ -8,8 +8,8 @@
   const COLORS = ["#2f5bea", "#e2557a", "#1f8a5b", "#b8650a", "#7b4fd6", "#0f8a9c", "#c53c3c", "#5b6b2f"];
 
   const SIZES = [
-    { id: 1, label: "Quick hang", hint: "2–5 people, barely any planning", modules: ["guests", "notes"] },
-    { id: 2, label: "Get-together", hint: "5–12 people, a few things to sort", modules: ["guests", "bring", "poll", "notes"] },
+    { id: 1, label: "Quick hang", hint: "2–5 people, barely any planning", modules: ["guests", "ideas", "notes"] },
+    { id: 2, label: "Get-together", hint: "5–12 people, a few things to sort", modules: ["guests", "bring", "poll", "ideas", "notes"] },
     { id: 3, label: "Party", hint: "10–30 people, tasks and costs", modules: ["guests", "bring", "tasks", "budget", "split", "schedule", "notes"] },
     { id: 4, label: "Big event", hint: "30+ people, trips, milestones", modules: ["guests", "tasks", "budget", "split", "schedule", "bring", "poll", "notes"] },
   ];
@@ -22,6 +22,7 @@
     split: "Split the bill",
     schedule: "Schedule",
     poll: "Group vote",
+    ideas: "Ideas nearby",
     notes: "Notes",
   };
 
@@ -914,6 +915,212 @@
   let settleMode = "bill"; // "bill" | "fewest"
   try { if (localStorage.getItem("hangout-hq-settle") === "fewest") settleMode = "fewest"; } catch (_) { /* default */ }
 
+  // ---------- ideas nearby ----------
+  // Places come from OpenStreetMap through Nominatim (free, no key). Its usage policy
+  // allows at most one request a second, so searches run one category at a time and
+  // results appear as they arrive. Locations are only sent to search, never saved.
+
+  const NOMINATIM = "https://nominatim.openstreetmap.org/search";
+  const IDEA_CATS = [["all", "All"], ["food", "Food"], ["coffee", "Coffee & desserts"], ["outdoors", "Outdoors"],
+    ["fun", "Games & fun"], ["culture", "Culture"], ["nightlife", "Nightlife"], ["shopping", "Malls"]];
+  const IDEA_QUERIES = {
+    food: ["restaurant", "fast food"], coffee: ["cafe", "ice cream"], outdoors: ["park", "beach", "viewpoint"],
+    fun: ["cinema", "karaoke", "bowling", "amusement arcade", "theme park"], culture: ["museum", "gallery"],
+    nightlife: ["bar", "pub"], shopping: ["mall"],
+  };
+  const IDEA_STARTER = ["restaurant", "cafe", "park", "mall", "cinema", "karaoke", "museum", "bar"];
+  const IDEA_KINDS = {
+    "amenity:restaurant": ["food", "Restaurant"], "amenity:fast_food": ["food", "Fast food"], "amenity:food_court": ["food", "Food court"],
+    "amenity:cafe": ["coffee", "Café"], "amenity:ice_cream": ["coffee", "Ice cream"],
+    "amenity:bar": ["nightlife", "Bar"], "amenity:pub": ["nightlife", "Pub"], "amenity:nightclub": ["nightlife", "Club"],
+    "amenity:cinema": ["fun", "Cinema"], "amenity:ktv": ["fun", "Karaoke"], "amenity:karaoke_box": ["fun", "Karaoke"],
+    "amenity:theatre": ["culture", "Theater"], "amenity:arts_centre": ["culture", "Arts center"],
+    "leisure:park": ["outdoors", "Park"], "leisure:garden": ["outdoors", "Garden"], "leisure:beach_resort": ["outdoors", "Beach resort"],
+    "natural:beach": ["outdoors", "Beach"], "tourism:viewpoint": ["outdoors", "Viewpoint"],
+    "leisure:bowling_alley": ["fun", "Bowling"], "leisure:amusement_arcade": ["fun", "Arcade"], "leisure:escape_game": ["fun", "Escape room"],
+    "leisure:water_park": ["fun", "Water park"], "leisure:miniature_golf": ["fun", "Mini golf"], "tourism:theme_park": ["fun", "Theme park"],
+    "tourism:zoo": ["fun", "Zoo"], "tourism:aquarium": ["fun", "Aquarium"],
+    "tourism:museum": ["culture", "Museum"], "tourism:gallery": ["culture", "Gallery"], "tourism:attraction": ["culture", "Attraction"],
+    "shop:mall": ["shopping", "Mall"],
+  };
+
+  const ideas = new Map();       // "home" or hangout id -> search state
+  const ideaCache = new Map();   // query + area -> raw results, for this visit
+  let nominatimChain = Promise.resolve(), lastNominatim = 0;
+
+  // One request at a time, at least 1.1 s apart.
+  function nominatim(params) {
+    const run = async () => {
+      const wait = lastNominatim + 1100 - Date.now();
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      lastNominatim = Date.now();
+      const r = await fetch(`${NOMINATIM}?${new URLSearchParams({ format: "jsonv2", ...params })}`, { headers: { "Accept-Language": "en" } });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    };
+    const p = nominatimChain.then(run, run);
+    nominatimChain = p.catch(() => {});
+    return p;
+  }
+
+  function distanceM(a, b) {
+    const R = 6371000, rad = (x) => (x * Math.PI) / 180;
+    const dLat = rad(b.lat - a.lat), dLon = rad(b.lon - a.lon);
+    const h2 = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h2));
+  }
+  const fmtDistance = (m) => (m < 950 ? `${Math.max(50, Math.round(m / 50) * 50)} m` : `${(m / 1000).toFixed(m < 9950 ? 1 : 0)} km`);
+  const titleCase = (t) => t.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+  function classifyPlace(x) {
+    const name = x.name || "";
+    if (/karaoke|videoke|\bktv\b/i.test(name)) return ["fun", "Karaoke"];
+    return IDEA_KINDS[`${x.category}:${x.type}`] || null;
+  }
+
+  function ideaState(key) {
+    if (!ideas.has(key)) ideas.set(key, { status: "idle", cat: "all", radius: 3000, places: new Map(), loaded: new Set(), failedQ: new Set(), pending: 0, failed: 0, gen: 0, show: 30 });
+    return ideas.get(key);
+  }
+
+  function startIdeas(key, from) {
+    const st = ideaState(key);
+    Object.assign(st, { status: "loading", from, places: new Map(), loaded: new Set(), failedQ: new Set(), pending: 0, failed: 0, gen: st.gen + 1, show: 30, error: "" });
+    queueIdeas(key);
+  }
+
+  // Fetch whatever the current category still needs.
+  function queueIdeas(key) {
+    const st = ideaState(key);
+    if (!st.from) return;
+    const wanted = st.cat === "all" ? IDEA_STARTER : IDEA_QUERIES[st.cat];
+    const { lat, lon } = st.from;
+    const dLat = st.radius / 111320, dLon = st.radius / (111320 * Math.cos((lat * Math.PI) / 180));
+    const viewbox = [lon - dLon, lat + dLat, lon + dLon, lat - dLat].map((n) => n.toFixed(5)).join(",");
+    const gen = st.gen;
+    wanted.filter((q) => !st.loaded.has(q)).forEach((q) => {
+      st.loaded.add(q);
+      st.pending++;
+      const cacheKey = `${q}|${viewbox}`;
+      const got = ideaCache.has(cacheKey) ? Promise.resolve(ideaCache.get(cacheKey))
+        : nominatim({ amenity: q, viewbox, bounded: 1, limit: 40, extratags: 1 }).then((list) => { ideaCache.set(cacheKey, list); return list; });
+      got.then((list) => {
+        if (st.gen !== gen) return;
+        list.forEach((x) => {
+          const kind = classifyPlace(x);
+          if (!kind || !x.name) return;
+          const at = { lat: Number(x.lat), lon: Number(x.lon) };
+          const dist = distanceM(st.from, at);
+          if (dist > st.radius * 1.05) return;
+          const cuisine = x.extratags?.cuisine ? titleCase(x.extratags.cuisine.split(";")[0]) : "";
+          st.places.set(`${x.osm_type}${x.osm_id}`, { name: x.name, cat: kind[0], kind: kind[1], cuisine, dist, ...at });
+        });
+      }).catch(() => { if (st.gen === gen) { st.failed++; st.failedQ.add(q); } })
+        .finally(() => {
+          if (st.gen !== gen) return;
+          st.pending--;
+          if (!st.pending) st.status = st.places.size || !st.failed ? "done" : "error";
+          if (st.status === "error") st.error = "Couldn't load places right now. Check your connection and try again in a minute.";
+          refreshIdeas(key);
+        });
+    });
+    refreshIdeas(key);
+  }
+
+  function ideasNearMe(key) {
+    const st = ideaState(key);
+    if (!navigator.geolocation) { Object.assign(st, { status: "error", error: "This browser can't share your location. Search a place instead." }); refreshIdeas(key); return; }
+    Object.assign(st, { status: "locating", error: "" });
+    refreshIdeas(key);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => startIdeas(key, { lat: pos.coords.latitude, lon: pos.coords.longitude, label: "you" }),
+      (err) => {
+        Object.assign(st, { status: "error", error: err.code === 1
+          ? "Location is turned off for this site. Allow it in your browser settings, or search a place instead."
+          : "Couldn't find your location. Try again, or search a place instead." });
+        refreshIdeas(key);
+      },
+      { enableHighAccuracy: false, timeout: 15000, maximumAge: 300000 },
+    );
+  }
+
+  async function ideasNearPlace(key, text) {
+    const st = ideaState(key);
+    const q = (text || "").trim();
+    if (!q) return;
+    Object.assign(st, { status: "locating", error: "" });
+    refreshIdeas(key);
+    try {
+      let found = await nominatim({ q, limit: 1, countrycodes: "ph" });
+      if (!found.length) found = await nominatim({ q, limit: 1 });
+      if (!found.length) {
+        Object.assign(st, { status: "error", error: `Couldn't find “${q}” on the map. Try adding the city, like “${q}, Makati”.` });
+        refreshIdeas(key);
+        return;
+      }
+      startIdeas(key, { lat: Number(found[0].lat), lon: Number(found[0].lon), label: q });
+    } catch (_) {
+      Object.assign(st, { status: "error", error: "Couldn't reach the map search. Check your connection and try again." });
+      refreshIdeas(key);
+    }
+  }
+
+  // Only the Ideas box re-renders as results arrive, so nothing else on the page jumps.
+  function refreshIdeas(key) {
+    const box = document.querySelector(`[data-ideas="${CSS.escape(key)}"]`);
+    if (box) { box.innerHTML = ideasBody(key); }
+  }
+
+  function ideasBody(key) {
+    const st = ideaState(key);
+    const h = key === "home" ? null : hangout(key);
+    const edit = h ? canEdit(h) : false;
+    const searchForm = `<form class="add-row" data-form="ideas-search">
+        <input class="input" name="q" placeholder="Search a place, e.g. BGC or Tagaytay" aria-label="Place to search near" autocomplete="off">
+        <button class="btn btn-sm">Search</button>
+      </form>`;
+    const start = `<div class="ideas-start">
+        ${h?.place ? `<button class="btn btn-sm btn-primary" data-action="ideas-place">Near ${esc(h.place)}</button>` : ""}
+        <button class="btn btn-sm ${h?.place ? "" : "btn-primary"}" data-action="ideas-me">Near me</button>
+      </div>
+      ${searchForm}
+      <p class="muted small">Your location is only used to search OpenStreetMap. It isn't saved.</p>`;
+    if (st.status === "idle") {
+      return `<p class="muted small">Find food, cafés, parks, karaoke, malls and more around a place.</p>${start}`;
+    }
+    if (st.status === "locating") {
+      return `<div class="ideas-wait" role="status"><span class="spinner" aria-hidden="true"></span>Finding the spot…</div>`;
+    }
+    if (st.status === "error" && !st.places.size) {
+      return `<div class="banner">${esc(st.error)}</div>${start}`;
+    }
+    const all = [...st.places.values()].sort((a, b) => a.dist - b.dist);
+    const shown = st.cat === "all" ? all : all.filter((p) => p.cat === st.cat);
+    st.view = shown.slice(0, st.show);
+    const where = st.from.label === "you" ? "you" : esc(st.from.label);
+    return `
+      <div class="ideas-head">
+        <span class="small">Near <b>${where}</b> · within ${st.radius / 1000} km</span>
+        <button class="btn btn-sm btn-ghost" data-action="ideas-reset">Change</button>
+      </div>
+      <div class="chips ideas-radius" role="group" aria-label="Distance">${[1000, 3000, 10000].map((r) => `<button class="chip" data-action="ideas-radius" data-v="${r}" aria-pressed="${st.radius === r}">${r / 1000} km</button>`).join("")}</div>
+      <div class="chips ideas-cats" role="group" aria-label="Kind of place">${IDEA_CATS.map(([c, l]) => `<button class="chip" data-action="ideas-cat" data-v="${c}" aria-pressed="${st.cat === c}">${l}</button>`).join("")}</div>
+      ${st.view.length ? `<ul class="list ideas-list">${st.view.map((p, i) => `
+        <li class="idea">
+          <span class="grow"><b>${esc(p.name)}</b><span class="muted small">${esc(p.kind)}${p.cuisine && p.cuisine !== p.kind ? ` · ${esc(p.cuisine)}` : ""} · ${fmtDistance(p.dist)}</span></span>
+          <span class="idea-actions">
+            <a class="btn btn-sm btn-ghost" href="https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lon}" target="_blank" rel="noopener">Map</a>
+            ${h && edit ? `<button class="btn btn-sm" data-action="idea-vote" data-i="${i}">+ Vote</button><button class="btn btn-sm" data-action="idea-use" data-i="${i}">Use as place</button>` : ""}
+            ${!h ? `<button class="btn btn-sm btn-primary" data-action="idea-plan" data-i="${i}">Plan here</button>` : ""}
+          </span>
+        </li>`).join("")}</ul>`
+        : st.pending ? "" : `<p class="muted small">Nothing like that within ${st.radius / 1000} km. Try a wider distance or another kind of place.</p>`}
+      ${shown.length > st.show ? `<button class="btn btn-sm btn-ghost" data-action="ideas-more">Show more (${shown.length - st.show})</button>` : ""}
+      ${st.pending ? `<div class="ideas-wait small" role="status"><span class="spinner" aria-hidden="true"></span>Finding more places…</div>` : ""}
+      ${st.failed && !st.pending ? `<p class="muted small">Some places couldn't load. <button class="link-btn" data-action="ideas-retry">Try again</button></p>` : ""}
+      <p class="muted small ideas-credit">Places from <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors.</p>`;
+  }
+
   // ---------- views ----------
 
   let filter = "upcoming";
@@ -1035,7 +1242,7 @@
       has("budget") && (group || h.budget) ? `<div class="stat"><span>Group total</span><b>${money(group)}${h.budget ? `<small> / ${money(h.budget)}</small>` : ""}</b>${h.budget ? `<div class="bar"><i style="width:${Math.min(100, (group / h.budget) * 100)}%;${group > h.budget ? "background:var(--bad)" : ""}"></i></div>` : ""}</div>` : "",
     ].join("");
 
-    const order = ["guests", "tasks", "bring", "schedule", "budget", "split", "poll", "notes"];
+    const order = ["guests", "tasks", "bring", "schedule", "budget", "split", "poll", "ideas", "notes"];
     const meta = metaOf(h);
     const sharedNote = isJoined(h)
       ? `<div class="share-note"><span>Shared by <b>${esc(meta?.ownerName || "a friend")}</b> · ${role === "editor" ? "You can edit" : "View only"}</span><button class="btn btn-sm btn-ghost btn-danger" data-action="leave-hangout">Leave</button></div>`
@@ -1282,6 +1489,9 @@
           </div>`).join("")}</div>
         <form class="add-row" data-form="add-option"><input class="input" name="text" placeholder="Add an option" aria-label="Add an option" required><button class="btn btn-sm">Add</button></form>
         <p class="muted small">Tap a name under an option to record their vote.</p>`);
+    }
+    if (m === "ideas") {
+      return moduleShell(m, h, `<div class="ideas" data-ideas="${esc(h.id)}">${ideasBody(h.id)}</div>`, { wide: true });
     }
     if (m === "notes") {
       return moduleShell(m, h, `<textarea class="textarea" data-field="notes" placeholder="Parking, dress code, the group chat link, anything else." aria-label="Notes">${esc(h.notes)}</textarea>`);
@@ -1534,6 +1744,10 @@
       html = h ? renderHangout(h)
         : stillLoading ? `<div class="loading" role="status"><span class="spinner" aria-hidden="true"></span>Loading…</div>`
         : `<div class="empty"><b>That hangout doesn't exist anymore.</b><a href="#/" class="btn">Back to hangouts</a></div>`;
+    } else if (hash.startsWith("#/ideas")) {
+      nav = "ideas";
+      html = `<div class="home-head"><div><h1>Things to do</h1><p class="muted">Looking for somewhere to go? Find food, cafés, parks, karaoke, malls and more near you or anywhere.</p></div></div>
+        <section class="module wide"><div class="ideas" data-ideas="home">${ideasBody("home")}</div></section>`;
     } else if (hash.startsWith("#/friends")) {
       html = renderFriends(); nav = "friends";
     } else {
@@ -1551,7 +1765,7 @@
     if (focusId === "search") { const s = $("#search"); s.focus(); s.setSelectionRange(s.value.length, s.value.length); }
     document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === nav));
     const h = m && hangout(m[1]);
-    document.title = h ? `${h.title} · Hangout HQ` : nav === "friends" ? "Friends · Hangout HQ" : "Hangout HQ";
+    document.title = h ? `${h.title} · Hangout HQ` : nav === "friends" ? "Friends · Hangout HQ" : nav === "ideas" ? "Things to do · Hangout HQ" : "Hangout HQ";
     hydratePhotos(app);
   }
 
@@ -1569,10 +1783,10 @@
     document.activeElement?.blur();
   }
 
-  function openHangoutDialog(h) {
+  function openHangoutDialog(h, preset = {}) {
     const dlg = $("#dialog");
     const isNew = !h;
-    const v = h || { title: "", size: 1, date: "", time: "", endTime: "", place: "", description: "" };
+    const v = h || { title: "", size: 1, date: "", time: "", endTime: "", place: "", description: "", ...preset };
     dlg.dataset.kind = "hangout";
     let pendingCover = null;     // a File chosen in this dialog
     let dropCover = false;       // "Remove" pressed for the existing cover
@@ -1710,7 +1924,7 @@
     const li = btn.closest("[data-id]");
     const id = li?.dataset.id;
 
-    const PLAN_ACTIONS = ["edit-hangout", "remove-cover", "invite-all", "toggle-item", "remove-item", "remove-schedule",
+    const PLAN_ACTIONS = ["idea-use", "idea-vote", "edit-hangout", "remove-cover", "invite-all", "toggle-item", "remove-item", "remove-schedule",
       "remove-expense", "remove-cost", "vote", "reset-poll", "add-module", "remove-module", "delete-hangout", "duplicate"];
     if (h && PLAN_ACTIONS.includes(action)) {
       if (!canEdit(h)) { toast("You can view this hangout. Ask the host if you want to edit it"); e.preventDefault(); render(); return; }
@@ -1734,6 +1948,29 @@
       case "remove-cover": removeCover(h); commit(); toast("Cover photo removed"); break;
       case "remove-profile-pic": removeProfilePicture(); break;
       case "new-hangout": openHangoutDialog(null); break;
+      case "ideas-me": case "ideas-place": case "ideas-reset": case "ideas-radius": case "ideas-cat":
+      case "ideas-more": case "ideas-retry": case "idea-use": case "idea-vote": case "idea-plan": {
+        const key = btn.closest("[data-ideas]")?.dataset.ideas;
+        if (!key) break;
+        const st = ideaState(key);
+        const place = st.view?.[Number(btn.dataset.i)];
+        if (action === "ideas-me") ideasNearMe(key);
+        else if (action === "ideas-place") ideasNearPlace(key, h?.place);
+        else if (action === "ideas-reset") { st.gen++; Object.assign(st, { status: "idle", from: null, places: new Map(), pending: 0, cat: "all" }); refreshIdeas(key); }
+        else if (action === "ideas-radius") { st.radius = Number(btn.dataset.v); startIdeas(key, st.from); }
+        else if (action === "ideas-cat") { st.cat = btn.dataset.v; st.show = 30; queueIdeas(key); }
+        else if (action === "ideas-more") { st.show += 30; refreshIdeas(key); }
+        else if (action === "ideas-retry") { st.failedQ.forEach((q) => st.loaded.delete(q)); st.failedQ.clear(); st.failed = 0; queueIdeas(key); }
+        else if (action === "idea-use" && place && h) { h.place = place.name; commit(); toast(`Place set to ${place.name}`); }
+        else if (action === "idea-vote" && place && h) {
+          if (!h.poll) h.poll = { question: "Where should we go?", options: [] };
+          if (h.poll.options.some((o) => o.text.toLowerCase() === place.name.toLowerCase())) { toast(`${place.name} is already in the vote`); break; }
+          h.poll.options.push({ id: uid(), text: place.name, votes: [] });
+          if (!h.modules.includes("poll")) h.modules.push("poll");
+          commit(); toast(`Added ${place.name} to the group vote`);
+        } else if (action === "idea-plan" && place) openHangoutDialog(null, { title: `Hangout at ${place.name}`, place: place.name });
+        break;
+      }
       case "edit-hangout": openHangoutDialog(h); break;
       case "close-dialog": closeDialog(); break;
       case "filter": filter = btn.dataset.v; render(); break;
@@ -1884,6 +2121,11 @@
     if (!form) return;
     e.preventDefault();
     if (form.dataset.form === "auth") { submitAuth(form); return; }
+    if (form.dataset.form === "ideas-search") {
+      const key = form.closest("[data-ideas]")?.dataset.ideas;
+      if (key) ideasNearPlace(key, new FormData(form).get("q"));
+      return;
+    }
     const fd = new FormData(form);
     const h = currentHangout();
     if (h && !canEdit(h)) return;
