@@ -19,6 +19,9 @@ The size decides which planning tools you start with, and you can add or hide an
 - **Ideas nearby**: food, cafés, parks, karaoke, cinemas, museums, bars and malls near you, the
   hangout's place, or anywhere you search. Sort by nearest or by your groups' ratings, recommend
   a place to the hangout, or plan a new hangout there.
+- **Good to know**: places can show **Open late**, **Open 24 hours**, **Wi-Fi** and **Good for work**.
+  Hours and Wi-Fi come from OpenStreetMap when it has them; you can set any of them (plus hours)
+  on your picks and recommendations. Filter by them in Ideas and Picks
 - **Picks**: your own list of places and things to do, separate from any hangout. Add your own or
   save them from Ideas and hangouts, edit them and give them a cover photo, rate them, search and sort, add one to a hangout or plan a
   new one there, and share the list with a link (friends can save your picks) or as text

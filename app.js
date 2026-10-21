@@ -986,6 +986,45 @@
   }
   const starsText = (avg, count) => (count ? `★ ${avg.toFixed(1)} <span class="muted">(${count})</span>` : "");
 
+  // Features of a place. "late", "24h" and "wifi" can come from OpenStreetMap; anyone
+  // can also set them (and "work") on their picks and recommendations.
+  const FEATURES = [["late", "Open late"], ["24h", "Open 24 hours"], ["wifi", "Wi-Fi"], ["work", "Good for work"]];
+  const FEATURE_KEYS = FEATURES.map(([k]) => k);
+  const cleanFeatures = (list) => FEATURE_KEYS.filter((k) => (list || []).includes(k));
+
+  // Reads an OpenStreetMap opening_hours value. "Late" means closing at 10 pm or later,
+  // or after midnight. Anything unusual simply counts as unknown.
+  function hoursInfo(oh) {
+    const s = String(oh || "").trim();
+    if (!s) return { is24: false, late: false };
+    if (/24\s*\/\s*7/.test(s)) return { is24: true, late: true };
+    let late = false, allDay = false, ranges = 0;
+    for (const m of s.matchAll(/(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})/g)) {
+      ranges++;
+      const a = Number(m[1]) * 60 + Number(m[2]), b = Number(m[3]) * 60 + Number(m[4]);
+      if (a === 0 && b >= 1440) { allDay = true; late = true; }
+      else if (b <= a || b >= 22 * 60) late = true;
+    }
+    const is24 = allDay && ranges === 1;
+    return { is24, late: late || is24 };
+  }
+  function osmFeatures(tags) {
+    const out = [];
+    const h = hoursInfo(tags?.opening_hours);
+    if (h.is24) out.push("24h"); else if (h.late) out.push("late");
+    const net = String(tags?.internet_access || "").toLowerCase();
+    if (net && net !== "no") out.push("wifi");
+    return out;
+  }
+  const featureBadges = (list, { noWifi = false } = {}) => {
+    const items = cleanFeatures(list).map((k) => `<span class="feat feat-${k}">${FEATURES.find(([x]) => x === k)[1]}</span>`);
+    if (noWifi) items.push(`<span class="feat feat-off">No Wi-Fi</span>`);
+    return items.length ? `<span class="feats">${items.join("")}</span>` : "";
+  };
+  const featureToggles = (selected = []) => `<div class="feat-toggles" role="group" aria-label="Features">
+      ${FEATURES.map(([k, l]) => `<label class="feat-toggle"><input type="checkbox" name="features" value="${k}" ${selected.includes(k) ? "checked" : ""}>${l}</label>`).join("")}
+    </div>`;
+
   const REC_KINDS = ["Food", "Café", "Dessert", "Bar", "Park", "Beach", "Karaoke", "Cinema", "Mall", "Museum", "Activity", "Other"];
 
   // Places from Ideas nearby have coordinates; your own picks are searched by name and "where".
@@ -995,10 +1034,10 @@
     return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([r.name, r.where].filter(Boolean).join(", "))}`;
   }
 
-  function addOwnRec(h, { name, kind, where, note }) {
+  function addOwnRec(h, { name, kind, where, note, features = [] }) {
     h.recs = h.recs || [];
     if (h.recs.some((r) => r.name.toLowerCase() === name.toLowerCase())) { toast(`${name} is already recommended`); return false; }
-    h.recs.push({ id: uid(), osm: "", name, kind: REC_KINDS.includes(kind) ? kind : "Other", cuisine: "", where, note,
+    h.recs.push({ id: uid(), osm: "", name, kind: REC_KINDS.includes(kind) ? kind : "Other", cuisine: "", where, note, hours: "", features: cleanFeatures(features),
       addedBy: myName(), addedAt: Date.now(), ratings: {} });
     commit();
     toast(`Added ${name}. Everyone in the hangout can see and rate it`);
@@ -1011,9 +1050,11 @@
       toast(`${place.name} is already recommended`);
       return;
     }
-    const { osm, name, kind, cuisine, lat, lon, where, note, photoId } = place;
+    const { osm, name, kind, cuisine, lat, lon, where, note, photoId, hours } = place;
+    const features = cleanFeatures(place.allFeatures || place.features);
     h.recs.push({ id: uid(), osm: osm || "", name, kind: kind || "Other", cuisine: cuisine || "", lat: lat ?? null, lon: lon ?? null,
-      where: where || "", note: note || "", photoId: isPublicPhoto(photoId) ? photoId : "", addedBy: myName(), addedAt: Date.now(), ratings: {} });
+      where: where || "", note: note || "", photoId: isPublicPhoto(photoId) ? photoId : "", hours: String(hours || "").slice(0, 60), features,
+      addedBy: myName(), addedAt: Date.now(), ratings: {} });
     if (!h.modules.includes("recs")) h.modules.splice(Math.max(0, h.modules.indexOf("ideas")), 0, "recs");
     commit();
     toast(`Recommended ${name}. Everyone in the hangout can see and rate it`);
@@ -1047,6 +1088,8 @@
         <label class="field"><span>Name</span><input class="input" id="place-name" name="name" maxlength="80" required value="${esc(item.name)}"></label>
         <label class="field"><span>Type</span><select class="select" id="place-kind" name="kind">${kinds.map((k) => `<option ${k === item.kind ? "selected" : ""}>${esc(k)}</option>`).join("")}</select></label>
         <label class="field"><span>Where</span><input class="input" id="place-where" name="where" maxlength="100" value="${esc(item.where || "")}" placeholder="Optional, e.g. Maginhawa St, QC"></label>
+        <label class="field"><span>Hours</span><input class="input" id="place-hours" name="hours" maxlength="60" value="${esc(item.hours || "")}" placeholder="Optional, e.g. 7am–2am daily"></label>
+        <div class="field"><span>Good to know</span>${featureToggles(cleanFeatures(item.features))}</div>
         <label class="field"><span>Why go?</span><input class="input" id="place-note" name="note" maxlength="140" value="${esc(item.note || "")}" placeholder="Optional, e.g. Best ube cheesecake"></label>
         <p class="auth-error" id="place-error" role="alert" hidden></p>
         <div class="dialog-actions">
@@ -1079,7 +1122,7 @@
       const fd = new FormData(e.target);
       const name = String(fd.get("name") || "").trim();
       if (!name) { $("#place-name").focus(); return; }
-      const changes = { name, kind: String(fd.get("kind") || "Other"), where: String(fd.get("where") || "").trim(), note: String(fd.get("note") || "").trim() };
+      const changes = { hours: String(fd.get("hours") || "").trim().slice(0, 60), features: cleanFeatures(fd.getAll("features")), name, kind: String(fd.get("kind") || "Other"), where: String(fd.get("where") || "").trim(), note: String(fd.get("note") || "").trim() };
       const old = item.photoId || "";
       if (pendingFile) {
         const btn = $("#place-save");
@@ -1113,14 +1156,26 @@
   // Shared as a read-only list in Firestore at lists/<id> (state.picksListId), refreshed
   // whenever it changes; friends with the link can save picks to their own list.
 
-  const picksView = { q: "", kind: "all", sort: "rated" };
+  const picksView = { q: "", kind: "all", sort: "rated", feats: [] };
   const listCache = new Map();   // list id -> {status, data}
   let listSent = "";
 
   const samePlace = (a, b) => !!(a && b) && ((a.osm && b.osm && a.osm === b.osm) || a.name.trim().toLowerCase() === b.name.trim().toLowerCase());
   const isPicked = (p) => (state?.picks || []).some((x) => samePlace(x, p));
-  const pickFields = ({ osm = "", name, kind = "Other", cuisine = "", where = "", note = "", lat = null, lon = null, photoId = "" }) =>
-    ({ osm: osm || "", name, kind: REC_KINDS.includes(kind) ? kind : (kind || "Other"), cuisine: cuisine || "", where: where || "", note: note || "", lat: lat ?? null, lon: lon ?? null, photoId: isPublicPhoto(photoId) ? photoId : "" });
+  function knownFeatures() {
+    const map = new Map();
+    const addFrom = (x) => {
+      const f = cleanFeatures(x.features);
+      if (!f.length) return;
+      [x.osm, x.name?.toLowerCase()].filter(Boolean).forEach((k) => map.set(k, cleanFeatures([...(map.get(k) || []), ...f])));
+    };
+    (state?.picks || []).forEach(addFrom);
+    [...(state?.hangouts || []), ...joinedHangouts].forEach((h) => (h.recs || []).forEach(addFrom));
+    return map;
+  }
+  const pickFields = ({ osm = "", name, kind = "Other", cuisine = "", where = "", note = "", lat = null, lon = null, photoId = "", hours = "", features, allFeatures }) =>
+    ({ osm: osm || "", name, kind: REC_KINDS.includes(kind) ? kind : (kind || "Other"), cuisine: cuisine || "", where: where || "", note: note || "", lat: lat ?? null, lon: lon ?? null,
+      photoId: isPublicPhoto(photoId) ? photoId : "", hours: String(hours || "").slice(0, 60), features: cleanFeatures(allFeatures || features) });
 
   function addPick(p) {
     state.picks = state.picks || [];
@@ -1144,7 +1199,8 @@
   function picksText() {
     const lines = sortPicks(state.picks || [], "rated").map((p) => {
       const bits = [p.kind, p.where].filter(Boolean).join(", ");
-      return `${p.rating ? `${starString(p.rating)} ` : "• "}${p.name}${bits ? ` (${bits})` : ""}${p.note ? `: ${p.note}` : ""}`;
+      const feats = cleanFeatures(p.features).map((k) => FEATURES.find(([x]) => x === k)[1]).join(", ");
+      return `${p.rating ? `${starString(p.rating)} ` : "• "}${p.name}${bits ? ` (${bits})` : ""}${feats ? ` [${feats}]` : ""}${p.note ? `: ${p.note}` : ""}`;
     });
     return [`${myName()}'s recommendations`, ...lines].join("\n");
   }
@@ -1189,6 +1245,7 @@
       <span class="grow">
         <b>${esc(p.name)}</b>
         <span class="muted small">${shared && p.rating ? `<span class="stars-avg">${starString(p.rating)}</span> · ` : ""}${esc(p.kind || "Place")}${p.cuisine && p.cuisine !== p.kind ? ` · ${esc(p.cuisine)}` : ""}${p.where ? ` · ${esc(p.where)}` : ""}</span>
+        ${featureBadges(p.features)}${p.hours ? `<span class="muted small hours">Hours: ${esc(p.hours)}</span>` : ""}
         ${p.note ? `<span class="rec-note">“${esc(p.note)}”</span>` : ""}
         ${shared ? "" : `<span class="rate" role="group" aria-label="Your rating for ${esc(p.name)}">
           ${[1, 2, 3, 4, 5].map((n) => `<button class="star" data-action="rate-pick" data-v="${n}" aria-pressed="${n <= (p.rating || 0)}" aria-label="${n} star${n > 1 ? "s" : ""}">★</button>`).join("")}
@@ -1215,6 +1272,7 @@
     const q = picksView.q.trim().toLowerCase();
     const shown = sortPicks(picks, picksView.sort)
       .filter((p) => picksView.kind === "all" || (p.kind || "Other") === picksView.kind)
+      .filter((p) => picksView.feats.every((f) => (p.features || []).includes(f) || (f === "late" && (p.features || []).includes("24h"))))
       .filter((p) => !q || [p.name, p.kind, p.where, p.note, p.cuisine].join(" ").toLowerCase().includes(q));
     return `
       <div class="home-head">
@@ -1236,12 +1294,14 @@
             <input class="input" name="where" maxlength="100" placeholder="Where (optional), e.g. Maginhawa St, QC" aria-label="Where">
             <input class="input" name="note" maxlength="140" placeholder="Why go? (optional), e.g. Best ube cheesecake" aria-label="Note">
           </div>
+          ${featureToggles()}
         </form>
         ${picks.length ? `
           <div class="toolbar">
             <input class="input" id="picks-search" type="search" placeholder="Search your picks" value="${esc(picksView.q)}" aria-label="Search your picks">
             <div class="chips" role="group" aria-label="Sort">${[["rated", "Top rated"], ["new", "Newest"], ["az", "A–Z"]].map(([v, l]) => `<button class="chip" data-action="picks-sort" data-v="${v}" aria-pressed="${picksView.sort === v}">${l}</button>`).join("")}</div>
           </div>
+          <div class="chips ideas-feats" role="group" aria-label="Only show">${FEATURES.map(([k, l]) => `<button class="chip" data-action="picks-feat" data-v="${k}" aria-pressed="${picksView.feats.includes(k)}">${l}</button>`).join("")}</div>
           ${kinds.length > 1 ? `<div class="chips ideas-cats" role="group" aria-label="Type">${["all", ...kinds].map((k) => `<button class="chip" data-action="picks-kind" data-v="${esc(k)}" aria-pressed="${picksView.kind === k}">${k === "all" ? "All" : esc(k)}</button>`).join("")}</div>` : ""}
           ${shown.length ? `<ul class="list recs-list">${shown.map((p) => pickRow(p)).join("")}</ul>` : `<p class="muted small">No picks match.</p>`}`
           : `<p class="muted small">No picks yet. Add a place you love above, or tap Save on anything in Ideas or a hangout's Recommendations.</p>`}
@@ -1367,7 +1427,9 @@
           if (dist > st.radius * 1.05) return;
           const cuisine = x.extratags?.cuisine ? titleCase(x.extratags.cuisine.split(";")[0]) : "";
           const osm = `${x.osm_type}${x.osm_id}`;
-          st.places.set(osm, { osm, name: x.name, cat: kind[0], kind: kind[1], cuisine, dist, ...at });
+          const net = String(x.extratags?.internet_access || "").toLowerCase();
+          st.places.set(osm, { osm, name: x.name, cat: kind[0], kind: kind[1], cuisine, dist, ...at,
+            hours: String(x.extratags?.opening_hours || "").slice(0, 60), features: osmFeatures(x.extratags), noWifi: net === "no" });
         });
       }).catch(() => { if (st.gen === gen) { st.failed++; st.failedQ.add(q); } })
         .finally(() => {
@@ -1453,7 +1515,12 @@
     const all = [...st.places.values()].sort(st.sort === "rated"
       ? (a, b) => scoreOf(b) - scoreOf(a) || (rated.get(b.osm)?.count || 0) - (rated.get(a.osm)?.count || 0) || a.dist - b.dist
       : (a, b) => a.dist - b.dist);
-    const shown = st.cat === "all" ? all : all.filter((p) => p.cat === st.cat);
+    // Your picks and your groups' recommendations add what the map doesn't know (like "Good for work").
+    const known = knownFeatures();
+    all.forEach((p) => { const extra = known.get(p.osm) || known.get(p.name.toLowerCase()); p.allFeatures = cleanFeatures([...(p.features || []), ...(extra || [])]); });
+    const feats = st.feats || [];
+    const shown = (st.cat === "all" ? all : all.filter((p) => p.cat === st.cat))
+      .filter((p) => feats.every((f) => p.allFeatures.includes(f) || (f === "late" && p.allFeatures.includes("24h"))));
     st.view = shown.slice(0, st.show);
     const where = st.from.label === "you" ? "you" : esc(st.from.label);
     return `
@@ -1467,10 +1534,13 @@
         <button class="chip" data-action="ideas-sort" data-v="rated" aria-pressed="${st.sort === "rated"}">Top rated</button>
       </div>
       ${st.sort === "rated" && !rated.size ? `<p class="muted small">No ratings yet. Recommend places to a hangout and rate them, and they'll rise to the top here.</p>` : ""}
+      <div class="chips ideas-feats" role="group" aria-label="Only show">${FEATURES.map(([k, l]) => `<button class="chip" data-action="ideas-feat" data-v="${k}" aria-pressed="${(st.feats || []).includes(k)}">${l}</button>`).join("")}</div>
       <div class="chips ideas-cats" role="group" aria-label="Kind of place">${IDEA_CATS.map(([c, l]) => `<button class="chip" data-action="ideas-cat" data-v="${c}" aria-pressed="${st.cat === c}">${l}</button>`).join("")}</div>
       ${st.view.length ? `<ul class="list ideas-list">${st.view.map((p, i) => `
         <li class="idea">
-          <span class="grow"><b>${esc(p.name)}</b><span class="muted small">${rated.get(p.osm) ? `<span class="stars-avg">${starsText(rated.get(p.osm).sum / rated.get(p.osm).count, rated.get(p.osm).count)}</span> · ` : ""}${esc(p.kind)}${p.cuisine && p.cuisine !== p.kind ? ` · ${esc(p.cuisine)}` : ""} · ${fmtDistance(p.dist)}</span></span>
+          <span class="grow"><b>${esc(p.name)}</b><span class="muted small">${rated.get(p.osm) ? `<span class="stars-avg">${starsText(rated.get(p.osm).sum / rated.get(p.osm).count, rated.get(p.osm).count)}</span> · ` : ""}${esc(p.kind)}${p.cuisine && p.cuisine !== p.kind ? ` · ${esc(p.cuisine)}` : ""} · ${fmtDistance(p.dist)}</span>
+            ${featureBadges(p.allFeatures, { noWifi: p.noWifi && !p.allFeatures.includes("wifi") })}
+            ${p.hours ? `<span class="muted small hours" title="${esc(p.hours)}">Hours: ${esc(p.hours)}</span>` : ""}</span>
           <span class="idea-actions">
             <a class="btn btn-sm btn-ghost" href="https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lon}" target="_blank" rel="noopener">Map</a>
             ${h && edit ? ((h.recs || []).some((r) => r.osm === p.osm) ? `<span class="tag">Recommended</span>` : `<button class="btn btn-sm btn-primary" data-action="idea-recommend" data-i="${i}">Recommend</button>`) : ""}
@@ -1869,6 +1939,7 @@
             <input class="input" name="where" maxlength="100" placeholder="Where (optional), e.g. Maginhawa St, QC" aria-label="Where">
             <input class="input" name="note" maxlength="140" placeholder="Why go? (optional), e.g. Best ube cheesecake" aria-label="Note">
           </div>
+          ${featureToggles()}
           ${(state.picks || []).some((p) => !(h.recs || []).some((r) => samePlace(r, p))) ? `
           <select class="select" data-field="rec-from-pick" aria-label="Add from my picks">
             <option value="">Or add from my picks…</option>
@@ -1883,6 +1954,7 @@
           <span class="grow">
             <b>${esc(r.name)}</b>
             <span class="muted small">${count ? `<span class="stars-avg">${starsText(avg, count)}</span> · ` : ""}${esc(r.kind || "Place")}${r.cuisine && r.cuisine !== r.kind ? ` · ${esc(r.cuisine)}` : ""}${r.where ? ` · ${esc(r.where)}` : ""}${r.addedBy ? ` · added by ${esc(r.addedBy)}` : ""}</span>
+            ${featureBadges(r.features)}${r.hours ? `<span class="muted small hours">Hours: ${esc(r.hours)}</span>` : ""}
             ${r.note ? `<span class="rec-note">“${esc(r.note)}”</span>` : ""}
             <span class="rate" role="group" aria-label="Your rating for ${esc(r.name)}">
               ${[1, 2, 3, 4, 5].map((n) => `<button class="star" data-action="rate-rec" data-v="${n}" aria-pressed="${n <= mine}" aria-label="${n} star${n > 1 ? "s" : ""}">★</button>`).join("")}
@@ -2366,7 +2438,7 @@
       case "remove-profile-pic": removeProfilePicture(); break;
       case "new-hangout": openHangoutDialog(null); break;
       case "ideas-me": case "ideas-place": case "ideas-reset": case "ideas-radius": case "ideas-cat":
-      case "ideas-more": case "ideas-retry": case "ideas-sort": case "idea-recommend": case "idea-plan": case "idea-save": {
+      case "ideas-more": case "ideas-retry": case "ideas-sort": case "idea-recommend": case "idea-plan": case "idea-save": case "ideas-feat": {
         const key = btn.closest("[data-ideas]")?.dataset.ideas;
         if (!key) break;
         const st = ideaState(key);
@@ -2379,6 +2451,13 @@
         else if (action === "ideas-more") { st.show += 30; refreshIdeas(key); }
         else if (action === "ideas-retry") { st.failedQ.forEach((q) => st.loaded.delete(q)); st.failedQ.clear(); st.failed = 0; queueIdeas(key); }
         else if (action === "ideas-sort") { st.sort = btn.dataset.v; refreshIdeas(key); }
+        else if (action === "ideas-feat") {
+          const f = btn.dataset.v;
+          st.feats = (st.feats || []).includes(f) ? st.feats.filter((x) => x !== f) : [...(st.feats || []), f];
+          // Cafés are where these matter most: load them if they aren't in yet.
+          if (st.cat === "all" && !st.loaded.has("cafe")) queueIdeas(key);
+          refreshIdeas(key);
+        }
         else if (action === "idea-recommend" && place && h) recommendPlace(h, place);
         else if (action === "idea-save" && place) { addPick(place); refreshIdeas(key); }
         else if (action === "idea-plan" && place) openHangoutDialog(null, { title: `Hangout at ${place.name}`, place: place.name });
@@ -2413,6 +2492,11 @@
       case "picks-copy": toast((await copyText(picksText())) ? "Your list is copied. Paste it in a chat" : "Couldn't copy your list"); break;
       case "picks-sort": picksView.sort = btn.dataset.v; render(); break;
       case "picks-kind": picksView.kind = btn.dataset.v; render(); break;
+      case "picks-feat": {
+        const f = btn.dataset.v;
+        picksView.feats = picksView.feats.includes(f) ? picksView.feats.filter((x) => x !== f) : [...picksView.feats, f];
+        render(); break;
+      }
       case "rate-pick": case "remove-pick": case "pick-plan": case "edit-pick": {
         const pick = (state.picks || []).find((p) => p.id === id);
         if (!pick) break;
@@ -2590,7 +2674,7 @@
       const fd2 = new FormData(form);
       const name = String(fd2.get("name") || "").trim();
       if (!name) { toast("Name the place or activity"); return; }
-      if (addPick({ name, kind: fd2.get("kind"), where: String(fd2.get("where") || "").trim(), note: String(fd2.get("note") || "").trim() })) {
+      if (addPick({ name, kind: fd2.get("kind"), where: String(fd2.get("where") || "").trim(), note: String(fd2.get("note") || "").trim(), features: fd2.getAll("features") })) {
         $('[data-form="add-pick"] input[name="name"]')?.focus();
       }
       return;
@@ -2633,7 +2717,7 @@
       case "add-rec": {
         const name = String(fd.get("name") || "").trim();
         if (!name) { toast("Name the place or activity"); return; }
-        const ok = addOwnRec(h, { name, kind: fd.get("kind"), where: String(fd.get("where") || "").trim(), note: String(fd.get("note") || "").trim() });
+        const ok = addOwnRec(h, { name, kind: fd.get("kind"), where: String(fd.get("where") || "").trim(), note: String(fd.get("note") || "").trim(), features: fd.getAll("features") });
         if (ok) $('[data-form="add-rec"] input[name="name"]')?.focus();
         break;
       }

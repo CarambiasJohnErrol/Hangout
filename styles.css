@@ -839,3 +839,28 @@ a.btn { text-decoration: none; }
 @media (max-width: 640px) {
   .pick .idea-actions .pick-target { max-width: none; }
 }
+
+/* ---------- Place features: open late, 24 hours, Wi-Fi, good for work ---------- */
+.feats { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.feat {
+  font-size: .7rem; font-weight: 700; padding: 1px 7px; border-radius: 999px; white-space: nowrap;
+  background: var(--accent-soft); color: var(--accent);
+}
+.feat-24h, .feat-late { background: var(--warn-soft); color: var(--warn); }
+.feat-wifi { background: var(--accent-soft); color: var(--accent); }
+.feat-work { background: var(--good-soft); color: var(--good); }
+.feat-off { background: var(--surface-2); color: var(--muted); }
+.hours { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.feat-toggles { display: flex; flex-wrap: wrap; gap: 6px; }
+.feat-toggle {
+  display: inline-flex; align-items: center; gap: 6px; font-size: .82rem; font-weight: 600; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; background: var(--surface);
+}
+.feat-toggle:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.feat-toggle input { accent-color: var(--accent); margin: 0; }
+.ideas-feats { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; padding-bottom: 2px; }
+.ideas-feats::-webkit-scrollbar { display: none; }
+.ideas-feats .chip { flex: none; }
+.pick .feats { margin-top: 1px; }
+.pick .hours { font-size: .75rem; }
+@media (max-width: 640px) { .feat-toggle { padding: 6px 10px; } }
