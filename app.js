@@ -829,43 +829,90 @@
   const billPeople = (h) => h.guests.filter((g) => g.rsvp !== "no").map((g) => g.friendId);
   const splitOf = (h, e) => (e.everyone ? billPeople(h) : e.split || []).filter((x) => x && x !== EVERYONE);
 
+  // All bill math is in whole centavos so every line and total adds up exactly.
+  const toCents = (n) => Math.round((Number(n) || 0) * 100);
+
+  // How a paid bill is shared, in centavos. Leftover centavos (e.g. ₱100 ÷ 3) go one
+  // each to the people who didn't pay, so the payer never ends up owing themself.
+  function billShares(h, e) {
+    const people = splitOf(h, e);
+    const cents = toCents(e.amount);
+    if (!people.length || cents <= 0) return [];
+    const base = Math.floor(cents / people.length);
+    let extra = cents - base * people.length;
+    const order = [...people.filter((p) => p !== e.paidBy), ...people.filter((p) => p === e.paidBy)];
+    return order.map((id) => ({ id, cents: base + (extra-- > 0 ? 1 : 0) }));
+  }
+
   // Per person, over the bills someone has paid: their share, what they paid, and the
-  // difference (positive: they get money back; negative: they owe).
+  // difference (positive: they get money back; negative: they owe). Amounts in pesos.
   function billBreakdown(h) {
     const rows = {};
     const row = (id) => rows[id] || (rows[id] = { id, share: 0, paid: 0 });
     h.expenses.forEach((e) => {
-      const people = splitOf(h, e);
-      if (!people.length || !(e.amount > 0) || !e.paidBy) return;
-      row(e.paidBy).paid += e.amount;
-      people.forEach((id) => { row(id).share += e.amount / people.length; });
+      if (!e.paidBy) return;
+      const shares = billShares(h, e);
+      if (!shares.length) return;
+      row(e.paidBy).paid += toCents(e.amount);
+      shares.forEach((x) => { row(x.id).share += x.cents; });
     });
-    return Object.values(rows).map((r) => ({ ...r, balance: r.paid - r.share }));
+    return Object.values(rows).map((r) => ({ id: r.id, share: r.share / 100, paid: r.paid / 100, balance: (r.paid - r.share) / 100 }));
   }
 
-  function balances(h) {
-    const bal = {};
-    billBreakdown(h).forEach((r) => { bal[r.id] = r.balance; });
-    return bal;
+  // Settle up by bill: everyone pays each bill's payer their share of it. When two
+  // people owe each other, only the difference changes hands. Each payment keeps the
+  // bills it comes from, so it can be checked against the list above.
+  function settleByBill(h) {
+    const pairs = new Map(); // "a|b" with a<b -> {a, b, net (a→b, cents), items}
+    h.expenses.forEach((e) => {
+      if (!e.paidBy) return;
+      billShares(h, e).forEach(({ id, cents }) => {
+        if (id === e.paidBy || !cents) return;
+        const [a, b] = id < e.paidBy ? [id, e.paidBy] : [e.paidBy, id];
+        const key = `${a}|${b}`;
+        const p = pairs.get(key) || { a, b, net: 0, items: [] };
+        const sign = id === a ? 1 : -1;           // +: a owes b, -: b owes a
+        p.net += sign * cents;
+        p.items.push({ from: id, text: e.text, cents });
+        pairs.set(key, p);
+      });
+    });
+    const out = [];
+    pairs.forEach((p) => {
+      if (!p.net) return;
+      const from = p.net > 0 ? p.a : p.b, to = p.net > 0 ? p.b : p.a;
+      out.push({
+        from, to, amount: Math.abs(p.net) / 100,
+        plus: p.items.filter((x) => x.from === from).map((x) => ({ text: x.text, amount: x.cents / 100 })),
+        minus: p.items.filter((x) => x.from !== from).map((x) => ({ text: x.text, amount: x.cents / 100 })),
+      });
+    });
+    return out;
   }
-  function settleUp(bal) {
+
+  // Fewest payments: the same balances, settled with as few transfers as possible.
+  function settleFewest(h) {
     const debt = [], cred = [];
-    Object.entries(bal).forEach(([id, v]) => {
-      if (v < -0.005) debt.push({ id, v: -v });
-      else if (v > 0.005) cred.push({ id, v });
+    billBreakdown(h).forEach((r) => {
+      const c = Math.round(r.balance * 100);
+      if (c < 0) debt.push({ id: r.id, v: -c });
+      else if (c > 0) cred.push({ id: r.id, v: c });
     });
     debt.sort((a, b) => b.v - a.v); cred.sort((a, b) => b.v - a.v);
     const out = [];
     let i = 0, j = 0;
     while (i < debt.length && j < cred.length) {
       const amt = Math.min(debt[i].v, cred[j].v);
-      out.push({ from: debt[i].id, to: cred[j].id, amount: amt });
+      out.push({ from: debt[i].id, to: cred[j].id, amount: amt / 100 });
       debt[i].v -= amt; cred[j].v -= amt;
-      if (debt[i].v < 0.005) i++;
-      if (cred[j].v < 0.005) j++;
+      if (!debt[i].v) i++;
+      if (!cred[j].v) j++;
     }
     return out;
   }
+
+  let settleMode = "bill"; // "bill" | "fewest"
+  try { if (localStorage.getItem("hangout-hq-settle") === "fewest") settleMode = "fewest"; } catch (_) { /* default */ }
 
   // ---------- views ----------
 
@@ -1042,6 +1089,30 @@
     </select>`;
   }
 
+  function settleHTML(moves) {
+    const toggle = `<span class="settle-mode" role="group" aria-label="How to settle up">
+      <button class="chip" data-action="settle-mode" data-v="bill" aria-pressed="${settleMode === "bill"}">By bill</button>
+      <button class="chip" data-action="settle-mode" data-v="fewest" aria-pressed="${settleMode === "fewest"}">Fewest payments</button></span>`;
+    if (!moves.length) return `<div class="settle"><div class="settle-head"><b class="small">To settle up</b>${toggle}</div><span class="small">Everyone's square.</span></div>`;
+    const reason = (x) => {
+      if (!x.plus) return "";
+      const part = (it) => `${esc(it.text)} ${money(it.amount)}`;
+      return `<span class="settle-why">${x.plus.map(part).join(" + ")}${x.minus.length ? ` − ${x.minus.map(part).join(" − ")}` : ""}</span>`;
+    };
+    // Group by who pays, so each person sees everything they owe in one place.
+    const byPayer = new Map();
+    moves.forEach((x) => { if (!byPayer.has(x.from)) byPayer.set(x.from, []); byPayer.get(x.from).push(x); });
+    const groups = [...byPayer.entries()].sort((a, b) => fname(a[0]).localeCompare(fname(b[0])));
+    return `<div class="settle">
+      <div class="settle-head"><b class="small">To settle up</b>${toggle}</div>
+      ${groups.map(([from, list]) => `
+        <div class="settle-group">
+          <div class="settle-payer">${avatar(from)}<b>${esc(fname(from))}</b><span class="muted small">pays ${money(list.reduce((t, x) => t + x.amount, 0))} in total</span></div>
+          ${list.map((x) => `<div class="settle-row"><span class="arrow">→</span>${avatar(x.to)}<span class="settle-to"><b>${esc(fname(x.to))}</b>${reason(x)}</span><span class="money">${money(x.amount)}</span></div>`).join("")}
+        </div>`).join("")}
+    </div>`;
+  }
+
   function moduleShell(m, h, body, { wide = false, sub = "" } = {}) {
     return `<section class="module ${wide ? "wide" : ""}" data-module="${m}">
       <div class="module-head"><h2>${esc(MODULES[m])}</h2>
@@ -1146,7 +1217,7 @@
     }
     if (m === "split") {
       const bills = h.expenses;
-      const moves = settleUp(balances(h));
+      const moves = settleMode === "fewest" ? settleFewest(h) : settleByBill(h);
       const rows = billBreakdown(h).sort((a, b) => a.balance - b.balance || fname(a.id).localeCompare(fname(b.id)));
       const unpaid = bills.filter((e) => !e.paidBy).length;
       const everyoneNow = billPeople(h);
@@ -1184,8 +1255,7 @@
           <div class="bd-row bd-total"><span>Total</span><span class="money">${money(rows.reduce((t, r) => t + r.share, 0))}</span><span class="money">${money(rows.reduce((t, r) => t + r.paid, 0))}</span><span></span></div>
           ${unpaid ? `<p class="muted small">${unpaid} bill${unpaid > 1 ? "s" : ""} marked “Not paid yet” ${unpaid > 1 ? "aren't" : "isn't"} counted until someone pays.</p>` : ""}
         </div>` : ""}
-        ${moves.length ? `<div class="settle"><b class="small">To settle up</b>${moves.map((x) => `<div class="settle-row">${avatar(x.from)}<b>${esc(fname(x.from))}</b><span class="arrow">pays</span>${avatar(x.to)}<b>${esc(fname(x.to))}</b><span class="money" style="margin-left:auto">${money(x.amount)}</span></div>`).join("")}</div>`
-          : bills.some((e) => e.paidBy) ? `<div class="settle"><b class="small">Everyone's square.</b></div>` : ""}
+        ${bills.some((e) => e.paidBy) ? settleHTML(moves) : ""}
       `, { sub: bills.length ? `${money(billsTotal(h))}${unpaid ? ` · ${unpaid} not paid` : ""}` : "" });
     }
     if (m === "poll") {
@@ -1708,6 +1778,10 @@
         confirmInline(`Leave “${h.title}”? It disappears from your hangouts until someone sends you the link again.`, "Leave hangout", () => leaveShare(h));
         break;
       case "join-share": joinShare(); break;
+      case "settle-mode":
+        settleMode = btn.dataset.v;
+        try { localStorage.setItem("hangout-hq-settle", settleMode); } catch (_) { /* per-visit only */ }
+        render(); break;
       case "dismiss-join": pendingJoin = null; render(); break;
       case "invite-all":
         state.friends.forEach((f) => { if (!h.guests.some((g) => g.friendId === f.id)) h.guests.push({ friendId: f.id, rsvp: "pending" }); });

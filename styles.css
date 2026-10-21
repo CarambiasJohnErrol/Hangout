@@ -698,3 +698,20 @@ button.tag.perm[aria-pressed="true"] { background: var(--good-soft); color: var(
 }
 .bd-row > span:first-child { text-align: left !important; }
 .paid-by > .muted { white-space: nowrap; }
+
+/* ---------- To settle up ---------- */
+.settle-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.settle-mode { display: inline-flex; gap: 4px; }
+.settle-mode .chip { padding: 3px 10px; font-size: .78rem; }
+.settle-group { display: flex; flex-direction: column; gap: 4px; padding-top: 8px; border-top: 1px solid var(--line); }
+.settle-group:first-of-type { border-top: 0; }
+.settle-payer { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.settle-group .settle-row { padding-left: 10px; align-items: flex-start; flex-wrap: nowrap; }
+.settle-row .arrow { color: var(--muted); padding-top: 3px; }
+.settle-to { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.settle-to b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.settle-why { font-size: .78rem; color: var(--muted); overflow-wrap: anywhere; }
+.settle-row .money { padding-top: 2px; }
+@media (max-width: 640px) {
+  .settle-mode .chip { padding: 5px 10px; }
+}
