@@ -263,20 +263,27 @@
   })();
 
   const photoDoc = (id) => db.collection("users").doc(user.uid).collection("photos").doc(id);
+  // Pictures of places (picks and recommendations) must be visible to friends, so
+  // they live apart from private photos: pictures/<id>, readable by anyone signed in,
+  // written only by whoever uploaded them. Their ids start with PUBLIC_PREFIX.
+  const PUBLIC_PREFIX = "pub-";
+  const isPublicPhoto = (id) => String(id || "").startsWith(PUBLIC_PREFIX);
+  const pictureDoc = (id) => db.collection("pictures").doc(id);
   const photoStore = {
     put(id, data, kind) {
       if (!cloud) return idb.put(id, data);
+      if (isPublicPhoto(id)) return pictureDoc(id).set({ owner: user.uid, data, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
       return photoDoc(id).set({ data, kind, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
     },
     async get(id) {
       if (!cloud) return (await idb.get(id)) || null;
-      const snap = await photoDoc(id).get();
+      const snap = await (isPublicPhoto(id) ? pictureDoc(id) : photoDoc(id)).get();
       return snap.exists ? snap.data().data : null;
     },
     del(id) {
       if (!id) return Promise.resolve();
       photoCache.delete(id);
-      return (cloud ? photoDoc(id).delete() : idb.del(id)).catch(() => { /* already gone */ });
+      return (cloud ? (isPublicPhoto(id) ? pictureDoc(id) : photoDoc(id)).delete() : idb.del(id)).catch(() => { /* already gone, or not ours */ });
     },
   };
   const deleteCoversOf = (hangouts) => hangouts.forEach((x) => photoStore.del(x.cover?.id));
@@ -1004,12 +1011,100 @@
       toast(`${place.name} is already recommended`);
       return;
     }
-    const { osm, name, kind, cuisine, lat, lon, where, note } = place;
+    const { osm, name, kind, cuisine, lat, lon, where, note, photoId } = place;
     h.recs.push({ id: uid(), osm: osm || "", name, kind: kind || "Other", cuisine: cuisine || "", lat: lat ?? null, lon: lon ?? null,
-      where: where || "", note: note || "", addedBy: myName(), addedAt: Date.now(), ratings: {} });
+      where: where || "", note: note || "", photoId: isPublicPhoto(photoId) ? photoId : "", addedBy: myName(), addedAt: Date.now(), ratings: {} });
     if (!h.modules.includes("recs")) h.modules.splice(Math.max(0, h.modules.indexOf("ideas")), 0, "recs");
     commit();
     toast(`Recommended ${name}. Everyone in the hangout can see and rate it`);
+  }
+
+  // ---------- editing a place (pick or recommendation) ----------
+
+  // A replaced or removed place picture is deleted only when nothing else of yours uses it.
+  function photoInUse(id) {
+    if (!id) return false;
+    return (state.picks || []).some((p) => p.photoId === id)
+      || [...state.hangouts, ...joinedHangouts].some((h) => (h.recs || []).some((r) => r.photoId === id));
+  }
+
+  // onSave(changes) applies {name, kind, where, note, photoId} to the item and saves.
+  function openPlaceDialog(item, { heading, onSave }) {
+    const dlg = $("#dialog");
+    dlg.dataset.kind = "place";
+    let pendingFile = null, dropPhoto = false, previewUrl = null;
+    const kinds = REC_KINDS.includes(item.kind) ? REC_KINDS : [item.kind, ...REC_KINDS];
+    dlg.innerHTML = `
+      <form method="dialog" id="place-form">
+        <h2>${esc(heading)}</h2>
+        <div class="field"><span>Cover photo</span>
+          <div class="place-cover" id="place-cover">${item.photoId ? photoImg(item.photoId, "") : '<span class="muted small">No cover photo</span>'}</div>
+          <div class="row">
+            <label class="btn btn-sm">${item.photoId ? "Change photo" : "Add a cover photo"}<input type="file" accept="image/*" id="place-photo" hidden></label>
+            <button type="button" class="btn btn-sm btn-ghost btn-danger" id="place-photo-remove" ${item.photoId ? "" : "hidden"}>Remove</button>
+          </div>
+        </div>
+        <label class="field"><span>Name</span><input class="input" id="place-name" name="name" maxlength="80" required value="${esc(item.name)}"></label>
+        <label class="field"><span>Type</span><select class="select" id="place-kind" name="kind">${kinds.map((k) => `<option ${k === item.kind ? "selected" : ""}>${esc(k)}</option>`).join("")}</select></label>
+        <label class="field"><span>Where</span><input class="input" id="place-where" name="where" maxlength="100" value="${esc(item.where || "")}" placeholder="Optional, e.g. Maginhawa St, QC"></label>
+        <label class="field"><span>Why go?</span><input class="input" id="place-note" name="note" maxlength="140" value="${esc(item.note || "")}" placeholder="Optional, e.g. Best ube cheesecake"></label>
+        <p class="auth-error" id="place-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn" data-action="close-dialog">Cancel</button>
+          <button class="btn btn-primary" id="place-save">Save</button>
+        </div>
+      </form>`;
+    hydratePhotos(dlg);
+    dlg.showModal();
+    const cover = $("#place-cover"), removeBtn = $("#place-photo-remove");
+    $("#place-photo").addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      e.target.value = "";
+      if (!file) return;
+      if (!isImage(file)) { toast("Pick a photo or image file"); return; }
+      pendingFile = file; dropPhoto = false;
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = URL.createObjectURL(file);
+      cover.innerHTML = `<img src="${previewUrl}" alt="New cover photo">`;
+      removeBtn.hidden = false;
+    });
+    removeBtn.addEventListener("click", () => {
+      pendingFile = null; dropPhoto = true;
+      cover.innerHTML = '<span class="muted small">No cover photo</span>';
+      removeBtn.hidden = true;
+    });
+    dlg.addEventListener("close", () => { if (previewUrl) URL.revokeObjectURL(previewUrl); }, { once: true });
+    $("#place-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const name = String(fd.get("name") || "").trim();
+      if (!name) { $("#place-name").focus(); return; }
+      const changes = { name, kind: String(fd.get("kind") || "Other"), where: String(fd.get("where") || "").trim(), note: String(fd.get("note") || "").trim() };
+      const old = item.photoId || "";
+      if (pendingFile) {
+        const btn = $("#place-save");
+        btn.disabled = true; btn.textContent = "Uploading photo…";
+        try {
+          const data = await compressImage(pendingFile, 1200);
+          const id = PUBLIC_PREFIX + uid() + uid();
+          await photoStore.put(id, data, "place");
+          photoCache.set(id, data);
+          changes.photoId = id;
+        } catch (err) {
+          btn.disabled = false; btn.textContent = "Save";
+          const msg = $("#place-error");
+          msg.hidden = false;
+          msg.textContent = err && err.message === "decode" ? "That picture couldn't be opened. Try a JPEG or PNG." : "The photo didn't upload. Check your connection and try again.";
+          return;
+        }
+      } else if (dropPhoto) {
+        changes.photoId = "";
+      }
+      onSave(changes);
+      closeDialog();
+      if ("photoId" in changes && old && old !== changes.photoId && !photoInUse(old)) photoStore.del(old);
+      toast("Saved");
+    });
   }
 
   // ---------- my picks ----------
@@ -1023,8 +1118,8 @@
 
   const samePlace = (a, b) => !!(a && b) && ((a.osm && b.osm && a.osm === b.osm) || a.name.trim().toLowerCase() === b.name.trim().toLowerCase());
   const isPicked = (p) => (state?.picks || []).some((x) => samePlace(x, p));
-  const pickFields = ({ osm = "", name, kind = "Other", cuisine = "", where = "", note = "", lat = null, lon = null }) =>
-    ({ osm: osm || "", name, kind: REC_KINDS.includes(kind) ? kind : (kind || "Other"), cuisine: cuisine || "", where: where || "", note: note || "", lat: lat ?? null, lon: lon ?? null });
+  const pickFields = ({ osm = "", name, kind = "Other", cuisine = "", where = "", note = "", lat = null, lon = null, photoId = "" }) =>
+    ({ osm: osm || "", name, kind: REC_KINDS.includes(kind) ? kind : (kind || "Other"), cuisine: cuisine || "", where: where || "", note: note || "", lat: lat ?? null, lon: lon ?? null, photoId: isPublicPhoto(photoId) ? photoId : "" });
 
   function addPick(p) {
     state.picks = state.picks || [];
@@ -1087,7 +1182,8 @@
   function pickRow(p, { shared = false } = {}) {
     const map = recMapLink(p);
     const targets = shared ? [] : [...state.hangouts, ...joinedHangouts.filter(canEdit)].filter((h) => !isPast(h));
-    return `<li class="rec pick" data-id="${esc(p.id || "")}">
+    return `<li class="rec pick ${p.photoId ? "has-cover" : ""}" data-id="${esc(p.id || "")}">
+      ${p.photoId ? `<div class="place-banner">${photoImg(p.photoId, `Photo of ${p.name}`)}</div>` : ""}
       <span class="grow">
         <b>${esc(p.name)}</b>
         <span class="muted small">${shared && p.rating ? `<span class="stars-avg">${starString(p.rating)}</span> · ` : ""}${esc(p.kind || "Place")}${p.cuisine && p.cuisine !== p.kind ? ` · ${esc(p.cuisine)}` : ""}${p.where ? ` · ${esc(p.where)}` : ""}</span>
@@ -1103,6 +1199,7 @@
             <option value="">Add to hangout…</option>
             ${targets.map((h) => `<option value="${esc(h.id)}" ${(h.recs || []).some((r) => samePlace(r, p)) ? "disabled" : ""}>${esc(h.title)}</option>`).join("")}
           </select>` : ""}
+          <button class="btn btn-sm" data-action="edit-pick">Edit</button>
           <button class="btn btn-sm" data-action="pick-plan">Plan here</button>
           <button class="icon-btn" data-action="remove-pick" aria-label="Remove ${esc(p.name)}">×</button>`}
       </span>
@@ -1779,7 +1876,8 @@
       return moduleShell(m, h, `${form}${list.length ? `<ul class="list recs-list">${list.map(({ r, avg, count }) => {
         const mine = myRating(h, r);
         const map = recMapLink(r);
-        return `<li class="rec" data-id="${esc(r.id)}">
+        return `<li class="rec ${r.photoId ? "has-cover" : ""}" data-id="${esc(r.id)}">
+          ${r.photoId ? `<div class="place-banner">${photoImg(r.photoId, `Photo of ${r.name}`)}</div>` : ""}
           <span class="grow">
             <b>${esc(r.name)}</b>
             <span class="muted small">${count ? `<span class="stars-avg">${starsText(avg, count)}</span> · ` : ""}${esc(r.kind || "Place")}${r.cuisine && r.cuisine !== r.kind ? ` · ${esc(r.cuisine)}` : ""}${r.where ? ` · ${esc(r.where)}` : ""}${r.addedBy ? ` · added by ${esc(r.addedBy)}` : ""}</span>
@@ -1792,7 +1890,7 @@
           <span class="idea-actions">
             ${map ? `<a class="btn btn-sm btn-ghost" href="${map}" target="_blank" rel="noopener">Map</a>` : ""}
             ${isPicked(r) ? "" : `<button class="btn btn-sm btn-ghost" data-action="rec-save">Save</button>`}
-            ${edit ? `<button class="btn btn-sm" data-action="rec-vote">+ Vote</button><button class="btn btn-sm" data-action="rec-use">Use as place</button>
+            ${edit ? `<button class="btn btn-sm" data-action="edit-rec">Edit</button><button class="btn btn-sm" data-action="rec-vote">+ Vote</button><button class="btn btn-sm" data-action="rec-use">Use as place</button>
             <button class="icon-btn" data-action="remove-rec" aria-label="Remove ${esc(r.name)}">×</button>` : ""}
           </span>
         </li>`;
@@ -2241,7 +2339,7 @@
     const li = btn.closest("[data-id]");
     const id = li?.dataset.id;
 
-    const PLAN_ACTIONS = ["idea-recommend", "rec-vote", "rec-use", "remove-rec", "edit-hangout", "remove-cover", "invite-all", "toggle-item", "remove-item", "remove-schedule",
+    const PLAN_ACTIONS = ["edit-rec", "idea-recommend", "rec-vote", "rec-use", "remove-rec", "edit-hangout", "remove-cover", "invite-all", "toggle-item", "remove-item", "remove-schedule",
       "remove-expense", "remove-cost", "vote", "reset-poll", "add-module", "remove-module", "delete-hangout", "duplicate"];
     if (h && PLAN_ACTIONS.includes(action)) {
       if (!canEdit(h)) { toast("You can view this hangout. Ask the host if you want to edit it"); e.preventDefault(); render(); return; }
@@ -2284,13 +2382,22 @@
         else if (action === "idea-plan" && place) openHangoutDialog(null, { title: `Hangout at ${place.name}`, place: place.name });
         break;
       }
-      case "rate-rec": case "rec-vote": case "rec-use": case "remove-rec": case "rec-save": {
+      case "rate-rec": case "rec-vote": case "rec-use": case "remove-rec": case "rec-save": case "edit-rec": {
         const rec = (h?.recs || []).find((r) => r.id === id);
         if (!rec) break;
         if (action === "rec-save") addPick(rec);
+        else if (action === "edit-rec") {
+          if (!canEdit(h)) break;
+          openPlaceDialog(rec, { heading: "Edit recommendation", onSave: (changes) => { Object.assign(rec, changes); commit(); } });
+        }
         else if (action === "rate-rec") rateRec(h, rec, Number(btn.dataset.v));
         else if (action === "rec-use") { h.place = rec.where ? `${rec.name}, ${rec.where}` : rec.name; commit(); toast(`Place set to ${h.place}`); }
-        else if (action === "remove-rec") { h.recs = h.recs.filter((r) => r.id !== rec.id); commit(); toast(`Removed ${rec.name}`); }
+        else if (action === "remove-rec") {
+          h.recs = h.recs.filter((r) => r.id !== rec.id);
+          commit();
+          if (rec.photoId && !photoInUse(rec.photoId)) photoStore.del(rec.photoId);
+          toast(`Removed ${rec.name}`);
+        }
         else {
           if (!h.poll) h.poll = { question: "Where should we go?", options: [] };
           if (h.poll.options.some((o) => o.text.toLowerCase() === rec.name.toLowerCase())) { toast(`${rec.name} is already in the vote`); break; }
@@ -2304,11 +2411,20 @@
       case "picks-copy": toast((await copyText(picksText())) ? "Your list is copied. Paste it in a chat" : "Couldn't copy your list"); break;
       case "picks-sort": picksView.sort = btn.dataset.v; render(); break;
       case "picks-kind": picksView.kind = btn.dataset.v; render(); break;
-      case "rate-pick": case "remove-pick": case "pick-plan": {
+      case "rate-pick": case "remove-pick": case "pick-plan": case "edit-pick": {
         const pick = (state.picks || []).find((p) => p.id === id);
         if (!pick) break;
+        if (action === "edit-pick") {
+          openPlaceDialog(pick, { heading: "Edit pick", onSave: (changes) => { Object.assign(pick, changes); commit(); } });
+          break;
+        }
         if (action === "rate-pick") { const n = Number(btn.dataset.v); pick.rating = pick.rating === n ? 0 : n; commit(); }
-        else if (action === "remove-pick") { state.picks = state.picks.filter((p) => p.id !== id); commit(); toast(`Removed ${pick.name}`); }
+        else if (action === "remove-pick") {
+          state.picks = state.picks.filter((p) => p.id !== id);
+          commit();
+          if (pick.photoId && !photoInUse(pick.photoId)) photoStore.del(pick.photoId);
+          toast(`Removed ${pick.name}`);
+        }
         else openHangoutDialog(null, { title: `Hangout at ${pick.name}`, place: pick.where ? `${pick.name}, ${pick.where}` : pick.name });
         break;
       }

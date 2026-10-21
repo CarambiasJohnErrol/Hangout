@@ -20,7 +20,7 @@ The size decides which planning tools you start with, and you can add or hide an
   hangout's place, or anywhere you search. Sort by nearest or by your groups' ratings, recommend
   a place to the hangout, or plan a new hangout there.
 - **Picks**: your own list of places and things to do, separate from any hangout. Add your own or
-  save them from Ideas and hangouts, rate them, search and sort, add one to a hangout or plan a
+  save them from Ideas and hangouts, edit them and give them a cover photo, rate them, search and sort, add one to a hangout or plan a
   new one there, and share the list with a link (friends can save your picks) or as text
 - **Recommendations**: places and activities recommended for a hangout, from Ideas nearby or
   added by hand (name, type, where, a note). Everyone in it can see and rate them 1-5 stars,
