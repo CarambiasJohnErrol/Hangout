@@ -1265,15 +1265,23 @@
     </li>`;
   }
 
-  function renderPicks() {
+  // The picks that match the current search, type and feature filters.
+  function filteredPicks() {
     const picks = state.picks || [];
     const kinds = [...new Set(picks.map((p) => p.kind || "Other"))].sort();
     if (picksView.kind !== "all" && !kinds.includes(picksView.kind)) picksView.kind = "all";
     const q = picksView.q.trim().toLowerCase();
-    const shown = sortPicks(picks, picksView.sort)
+    return sortPicks(picks, picksView.sort)
       .filter((p) => picksView.kind === "all" || (p.kind || "Other") === picksView.kind)
       .filter((p) => picksView.feats.every((f) => (p.features || []).includes(f) || (f === "late" && (p.features || []).includes("24h"))))
       .filter((p) => !q || [p.name, p.kind, p.where, p.note, p.cuisine].join(" ").toLowerCase().includes(q));
+  }
+
+  function renderPicks() {
+    const picks = state.picks || [];
+    const kinds = [...new Set(picks.map((p) => p.kind || "Other"))].sort();
+    const shown = filteredPicks();
+    const filtered = picksView.kind !== "all" || picksView.feats.length || picksView.q.trim();
     return `
       <div class="home-head">
         <div><h1>My picks</h1><p class="muted">Places and things to do you'd recommend. Use them for ideas, add them to a hangout, or share your list with friends.</p></div>
@@ -1303,9 +1311,172 @@
           </div>
           <div class="chips ideas-feats" role="group" aria-label="Only show">${FEATURES.map(([k, l]) => `<button class="chip" data-action="picks-feat" data-v="${k}" aria-pressed="${picksView.feats.includes(k)}">${l}</button>`).join("")}</div>
           ${kinds.length > 1 ? `<div class="chips ideas-cats" role="group" aria-label="Type">${["all", ...kinds].map((k) => `<button class="chip" data-action="picks-kind" data-v="${esc(k)}" aria-pressed="${picksView.kind === k}">${k === "all" ? "All" : esc(k)}</button>`).join("")}</div>` : ""}
+          <div class="wheel-cta">
+            <div><b>Can't decide?</b><span class="muted small">${shown.length >= 2 ? `Spin the wheel with ${filtered ? "these" : "your"} ${shown.length} picks.` : "Add at least 2 picks (or loosen the filters) to spin."}</span></div>
+            <button class="btn btn-primary btn-sm" data-action="open-wheel" ${shown.length >= 2 ? "" : "disabled"}>Spin the wheel</button>
+          </div>
           ${shown.length ? `<ul class="list recs-list">${shown.map((p) => pickRow(p)).join("")}</ul>` : `<p class="muted small">No picks match.</p>`}`
           : `<p class="muted small">No picks yet. Add a place you love above, or tap Save on anything in Ideas or a hangout's Recommendations.</p>`}
       </section>`;
+  }
+
+  // ---------- wheel of choices ----------
+  // Spins between the picks that match the Picks filters. Up to 12 slices; "Favor top
+  // rated" makes each slice's size 1 + its stars. Results come from the same random
+  // draw that sets where the wheel stops, so what you see is what was picked.
+
+  const WHEEL_MAX = 12;
+  const wheel = { items: [], weighted: false, angle: 0, spinning: false, result: null, pool: [] };
+
+  function openWheel() {
+    wheel.pool = filteredPicks();
+    wheel.result = null;
+    wheel.angle = 0;
+    wheel.items = sampleWheel();
+    const dlg = $("#dialog");
+    dlg.dataset.kind = "wheel";
+    renderWheelDialog();
+    dlg.showModal();
+  }
+
+  function sampleWheel() {
+    const pool = [...wheel.pool];
+    if (pool.length <= WHEEL_MAX) return pool;
+    if (wheel.weighted) return sortPicks(pool, "rated").slice(0, WHEEL_MAX);
+    for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+    return pool.slice(0, WHEEL_MAX);
+  }
+
+  const wheelWeights = () => wheel.items.map((p) => (wheel.weighted ? 1 + (p.rating || 0) : 1));
+
+  function renderWheelDialog() {
+    const dlg = $("#dialog");
+    const r = wheel.result;
+    const extra = wheel.pool.length - wheel.items.length;
+    dlg.innerHTML = `
+      <form method="dialog" class="wheel-sheet">
+        <div class="wheel-head">
+          <h2>Wheel of choices</h2>
+          <button type="button" class="icon-btn" data-action="close-dialog" aria-label="Close">×</button>
+        </div>
+        <p class="muted small">${wheel.items.length} picks on the wheel${extra > 0 ? ` · ${extra} more not shown` : ""}. Tap Spin and go wherever it lands.</p>
+        <div class="wheel-wrap">
+          <canvas id="wheel-canvas" width="600" height="600" aria-label="Wheel with ${wheel.items.length} choices" role="img"></canvas>
+          <span class="wheel-pointer" aria-hidden="true"></span>
+          <button type="button" class="wheel-hub" data-action="wheel-spin" ${wheel.spinning ? "disabled" : ""}>${wheel.spinning ? "…" : "Spin"}</button>
+        </div>
+        <div class="wheel-options">
+          <label class="feat-toggle"><input type="checkbox" id="wheel-weighted" ${wheel.weighted ? "checked" : ""}>Favor top rated</label>
+          ${extra > 0 ? `<button type="button" class="btn btn-sm btn-ghost" data-action="wheel-shuffle" ${wheel.spinning ? "disabled" : ""}>Shuffle picks</button>` : ""}
+        </div>
+        <div class="wheel-result" id="wheel-result" role="status" aria-live="polite">
+          ${r ? `
+            <span class="eyebrow">You're going to</span>
+            <b class="wheel-name">${esc(r.name)}</b>
+            <span class="muted small">${esc(r.kind || "Place")}${r.where ? ` · ${esc(r.where)}` : ""}</span>
+            ${featureBadges(r.features)}
+            <div class="wheel-actions">
+              ${recMapLink(r) ? `<a class="btn btn-sm" href="${recMapLink(r)}" target="_blank" rel="noopener">Map</a>` : ""}
+              <button type="button" class="btn btn-sm btn-primary" data-action="wheel-plan">Plan a hangout here</button>
+              <button type="button" class="btn btn-sm btn-ghost" data-action="wheel-skip">Not this one</button>
+            </div>` : ""}
+        </div>
+      </form>`;
+    drawWheel();
+    $("#wheel-weighted")?.addEventListener("change", (e) => {
+      wheel.weighted = e.target.checked;
+      wheel.items = sampleWheel();
+      wheel.result = null;
+      renderWheelDialog();
+    });
+  }
+
+  function drawWheel() {
+    const canvas = $("#wheel-canvas");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const size = canvas.width, c = size / 2, radius = c - 8;
+    const weights = wheelWeights();
+    const total = weights.reduce((a, b) => a + b, 0) || 1;
+    const styles = getComputedStyle(document.documentElement);
+    ctx.clearRect(0, 0, size, size);
+    ctx.save();
+    ctx.translate(c, c);
+    ctx.rotate(wheel.angle);
+    let start = -Math.PI / 2;
+    wheel.items.forEach((p, i) => {
+      const sweep = (weights[i] / total) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.arc(0, 0, radius, start, start + sweep);
+      ctx.closePath();
+      ctx.fillStyle = COLORS[i % COLORS.length];
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(255,255,255,.85)";
+      ctx.stroke();
+      // Label along the middle of the slice
+      ctx.save();
+      ctx.rotate(start + sweep / 2);
+      ctx.fillStyle = "#fff";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      const fontSize = Math.max(16, Math.min(28, 260 / Math.max(6, wheel.items.length)));
+      ctx.font = `700 ${fontSize}px ${styles.getPropertyValue("--font-body") || "sans-serif"}`;
+      let label = p.name;
+      const maxW = radius - 18 - size * 0.15; // stop short of the Spin button in the middle
+      while (ctx.measureText(label).width > maxW && label.length > 3) label = `${label.slice(0, -2).trimEnd()}…`;
+      ctx.fillText(label, radius - 18, 0);
+      ctx.restore();
+      start += sweep;
+    });
+    ctx.restore();
+  }
+
+  function spinWheel() {
+    if (wheel.spinning || wheel.items.length < 2) return;
+    const weights = wheelWeights();
+    const total = weights.reduce((a, b) => a + b, 0);
+    // Choose the winner first, then aim the wheel so it stops inside that slice.
+    let roll = Math.random() * total, index = 0;
+    while (roll >= weights[index]) { roll -= weights[index]; index++; }
+    const before = weights.slice(0, index).reduce((a, b) => a + b, 0);
+    const within = 0.15 + Math.random() * 0.7; // never right on a border
+    const sliceMiddle = ((before + weights[index] * within) / total) * Math.PI * 2;
+    // The pointer is at the top; slices start at the top too, so rotate back by sliceMiddle.
+    const current = ((wheel.angle % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+    const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const turns = reduced ? 1 : 5 + Math.floor(Math.random() * 3);
+    let delta = (Math.PI * 2 - sliceMiddle) - current;
+    if (delta < 0) delta += Math.PI * 2;
+    const from = wheel.angle, to = wheel.angle + turns * Math.PI * 2 + delta;
+    const duration = reduced ? 700 : 4200;
+    const t0 = performance.now();
+    wheel.spinning = true;
+    wheel.result = null;
+    renderWheelDialog();
+    const ease = (t) => 1 - Math.pow(1 - t, 4);
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      wheel.angle = to;
+      wheel.spinning = false;
+      wheel.result = wheel.items[index];
+      try { if (navigator.userActivation?.hasBeenActive) navigator.vibrate?.(40); } catch (_) { /* no vibration */ }
+      if ($("#dialog").open && $("#dialog").dataset.kind === "wheel") renderWheelDialog();
+    };
+    const step = (now) => {
+      if (done) return;
+      const t = Math.min(1, (now - t0) / duration);
+      wheel.angle = from + (to - from) * ease(t);
+      drawWheel();
+      if (t < 1 && $("#dialog").open && $("#dialog").dataset.kind === "wheel") { requestAnimationFrame(step); return; }
+      finish();
+    };
+    requestAnimationFrame(step);
+    // Browsers pause animation in background tabs; the spin still lands on time.
+    setTimeout(finish, duration + 150);
   }
 
   function renderSharedList(id) {
@@ -2489,6 +2660,29 @@
         break;
       }
       case "picks-share": sharePicks(); break;
+      case "open-wheel": openWheel(); break;
+      case "wheel-spin": spinWheel(); break;
+      case "wheel-shuffle": wheel.items = sampleWheel(); wheel.result = null; renderWheelDialog(); break;
+      case "wheel-skip": {
+        const r = wheel.result;
+        wheel.pool = wheel.pool.filter((p) => p !== r);
+        wheel.items = wheel.items.filter((p) => p !== r);
+        if (wheel.items.length < WHEEL_MAX) {
+          const more = wheel.pool.filter((p) => !wheel.items.includes(p));
+          wheel.items.push(...more.slice(0, WHEEL_MAX - wheel.items.length));
+        }
+        wheel.result = null;
+        if (wheel.items.length < 2) { closeDialog(); toast(wheel.items.length ? `Only ${wheel.items[0].name} is left. Looks like that's the one` : "No picks left on the wheel"); break; }
+        renderWheelDialog();
+        break;
+      }
+      case "wheel-plan": {
+        const r = wheel.result;
+        if (!r) break;
+        closeDialog();
+        openHangoutDialog(null, { title: `Hangout at ${r.name}`, place: r.where ? `${r.name}, ${r.where}` : r.name, date: todayISO() });
+        break;
+      }
       case "picks-copy": toast((await copyText(picksText())) ? "Your list is copied. Paste it in a chat" : "Couldn't copy your list"); break;
       case "picks-sort": picksView.sort = btn.dataset.v; render(); break;
       case "picks-kind": picksView.kind = btn.dataset.v; render(); break;

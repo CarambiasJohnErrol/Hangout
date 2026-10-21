@@ -864,3 +864,36 @@ a.btn { text-decoration: none; }
 .pick .feats { margin-top: 1px; }
 .pick .hours { font-size: .75rem; }
 @media (max-width: 640px) { .feat-toggle { padding: 6px 10px; } }
+
+/* ---------- Wheel of choices ---------- */
+.wheel-cta {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px 14px; flex-wrap: wrap;
+  background: linear-gradient(120deg, var(--accent-soft), var(--warn-soft)); border-radius: 12px; padding: 12px 14px;
+}
+.wheel-cta > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.wheel-sheet { gap: 10px !important; }
+.wheel-head { display: flex; justify-content: space-between; align-items: center; }
+.wheel-wrap { position: relative; width: min(320px, 100%); aspect-ratio: 1; margin: 6px auto 0; }
+.wheel-wrap canvas { width: 100%; height: 100%; display: block; border-radius: 50%; box-shadow: 0 6px 24px rgba(0, 0, 0, .25); }
+.wheel-pointer {
+  position: absolute; top: -6px; left: 50%; transform: translateX(-50%); width: 0; height: 0;
+  border-left: 14px solid transparent; border-right: 14px solid transparent; border-top: 26px solid var(--ink);
+  filter: drop-shadow(0 2px 2px rgba(0, 0, 0, .3)); z-index: 1;
+}
+.wheel-hub {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 76px; height: 76px; border-radius: 50%;
+  border: 4px solid #fff; background: var(--ink); color: var(--bg); font-family: var(--font-display); font-weight: 800; font-size: 1.05rem;
+  cursor: pointer; box-shadow: 0 3px 10px rgba(0, 0, 0, .3);
+}
+.wheel-hub:disabled { cursor: default; opacity: .9; }
+.wheel-hub:not(:disabled):hover { transform: translate(-50%, -50%) scale(1.05); }
+.wheel-options { display: flex; justify-content: center; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wheel-result { min-height: 24px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 4px; }
+.wheel-result .feats { justify-content: center; }
+.wheel-name { font-family: var(--font-display); font-size: 1.5rem; line-height: 1.15; overflow-wrap: anywhere; }
+.wheel-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; margin-top: 6px; }
+@media (max-width: 640px) {
+  .wheel-wrap { width: min(300px, 86vw); }
+  .wheel-hub { width: 68px; height: 68px; }
+}
+@media (prefers-reduced-motion: reduce) { .wheel-hub:not(:disabled):hover { transform: translate(-50%, -50%); } }
