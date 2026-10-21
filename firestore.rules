@@ -1,11 +1,19 @@
 rules_version = '2';
 
-// Each account's hangouts live in one document, users/<their uid>.
-// Only the signed-in owner can read or write it.
+// Each account's hangouts live in one document, users/<their uid>, and each
+// photo in users/<their uid>/photos/<photo id>.
+// Only the signed-in owner can read or write any of it.
 service cloud.firestore {
   match /databases/{database}/documents {
     match /users/{uid} {
       allow read, write: if request.auth != null && request.auth.uid == uid;
+
+      match /photos/{photoId} {
+        allow read, delete: if request.auth != null && request.auth.uid == uid;
+        allow create, update: if request.auth != null && request.auth.uid == uid
+          && request.resource.data.data is string
+          && request.resource.data.data.size() < 1000000;
+      }
     }
   }
 }

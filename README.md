@@ -12,6 +12,7 @@ The size decides which planning tools you start with, and you can add or hide an
 - **Schedule** for the run of the day
 - **Group vote** for picking a date, place or food
 - **Notes**
+- **Photos**: add pictures to any hangout and swipe through them full screen
 
 Share a hangout by copying a ready-to-paste invite for the group chat, or a link that lets a
 friend add the whole plan to their own Hangout HQ.
@@ -40,7 +41,8 @@ hangouts, saved to their account and synced across every device they sign in on.
    into [`firebase-config.js`](firebase-config.js).
 
 Each account's data is one Firestore document at `users/<uid>`, readable and writable only by
-that signed-in user. The first time someone signs up, any hangouts already saved in that browser
+that signed-in user. Photos are resized in the browser (max 1600px, under 1 MB) and stored one per
+document at `users/<uid>/photos/<id>`, under the same rule, so no paid Cloud Storage is needed. The first time someone signs up, any hangouts already saved in that browser
 move into their account.
 
 ## Without accounts

@@ -216,6 +216,229 @@
     location.hash = "#/";
   }
 
+  // ---------- photos ----------
+  // Hangouts keep only photo metadata ({id, w, h, addedAt}). The image itself is a
+  // resized JPEG data URL stored on its own: in Firestore at users/<uid>/photos/<id>
+  // when signed in, or in this browser's IndexedDB without accounts.
+
+  const photoCache = new Map();   // id -> data URL, or null when it can't be found
+  const photoLoads = new Map();   // id -> in-flight promise
+  const uploading = {};           // hangout id -> photos still being processed
+
+  const idb = (() => {
+    let opening;
+    const open = () => opening || (opening = new Promise((res, rej) => {
+      const r = indexedDB.open("hangout-hq-photos", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("photos");
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    }));
+    const run = async (mode, fn) => {
+      const d = await open();
+      return new Promise((res, rej) => {
+        const t = d.transaction("photos", mode);
+        const req = fn(t.objectStore("photos"));
+        t.oncomplete = () => res(req.result);
+        t.onerror = () => rej(t.error);
+      });
+    };
+    return {
+      get: (id) => run("readonly", (st) => st.get(id)),
+      put: (id, v) => run("readwrite", (st) => st.put(v, id)),
+      del: (id) => run("readwrite", (st) => st.delete(id)),
+    };
+  })();
+
+  const photoDoc = (id) => db.collection("users").doc(user.uid).collection("photos").doc(id);
+  const photoStore = {
+    put(id, data, hangoutId) {
+      if (!cloud) return idb.put(id, data);
+      return photoDoc(id).set({ data, hangoutId, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
+    },
+    async get(id) {
+      if (!cloud) return (await idb.get(id)) || null;
+      const snap = await photoDoc(id).get();
+      return snap.exists ? snap.data().data : null;
+    },
+    del(id) {
+      photoCache.delete(id);
+      return (cloud ? photoDoc(id).delete() : idb.del(id)).catch(() => { /* already gone */ });
+    },
+  };
+  const deletePhotosOf = (hangouts) => hangouts.forEach((x) => (x.photos || []).forEach((ph) => photoStore.del(ph.id)));
+
+  function loadPhoto(id) {
+    if (photoCache.has(id)) return Promise.resolve(photoCache.get(id));
+    if (!photoLoads.has(id)) {
+      photoLoads.set(id, photoStore.get(id)
+        .then((src) => { photoCache.set(id, src); return src; })
+        .catch(() => null)
+        .finally(() => photoLoads.delete(id)));
+    }
+    return photoLoads.get(id);
+  }
+
+  // Fill in any <img data-photo> that has no source yet.
+  function hydratePhotos(root) {
+    root.querySelectorAll("img[data-photo]:not([src])").forEach((img) => {
+      loadPhoto(img.dataset.photo).then((src) => {
+        if (src) img.src = src;
+        else img.closest(".photo-tile, .lb-stage")?.classList.add("missing");
+      });
+    });
+  }
+
+  // Resize to at most 1600px and re-encode as JPEG, shrinking until it fits well
+  // under Firestore's 1 MB document limit.
+  async function compressImage(file) {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise((res, rej) => {
+        const i = new Image();
+        i.onload = () => res(i);
+        i.onerror = () => rej(new Error("decode"));
+        i.src = url;
+      });
+      let max = 1600, quality = 0.82, out = "", w = 0, ht = 0;
+      for (let tries = 0; tries < 6; tries++) {
+        const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+        w = Math.max(1, Math.round(img.naturalWidth * scale));
+        ht = Math.max(1, Math.round(img.naturalHeight * scale));
+        const c = document.createElement("canvas");
+        c.width = w; c.height = ht;
+        const ctx = c.getContext("2d");
+        ctx.fillStyle = "#fff"; // transparent PNGs get a white background, not black
+        ctx.fillRect(0, 0, w, ht);
+        ctx.drawImage(img, 0, 0, w, ht);
+        out = c.toDataURL("image/jpeg", quality);
+        if (out.length < 900000) break;
+        max = Math.round(max * 0.8);
+        quality = Math.max(0.6, quality - 0.08);
+      }
+      return { data: out, w, h: ht };
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  async function addPhotos(hangoutId, files) {
+    const images = files.filter((f) => f.type.startsWith("image/") || /\.(heic|heif)$/i.test(f.name));
+    if (!images.length) { toast("Pick a photo or image file"); return; }
+    uploading[hangoutId] = (uploading[hangoutId] || 0) + images.length;
+    render();
+    let added = 0, unreadable = 0, failed = 0;
+    for (const file of images) {
+      try {
+        const { data, w, h: height } = await compressImage(file);
+        const id = uid();
+        await photoStore.put(id, data, hangoutId);
+        photoCache.set(id, data);
+        const target = hangout(hangoutId);
+        if (target) {
+          (target.photos || (target.photos = [])).push({ id, w, h: height, addedAt: Date.now() });
+          added++;
+          save();
+        } else {
+          photoStore.del(id);
+        }
+      } catch (e) {
+        if (e && e.message === "decode") unreadable++; else failed++;
+      }
+      uploading[hangoutId]--;
+      render();
+    }
+    if (unreadable) toast(`${unreadable} photo${unreadable > 1 ? "s" : ""} couldn't be opened. Try a JPEG or PNG`);
+    else if (failed) toast(`${failed} photo${failed > 1 ? "s" : ""} didn't upload. Check your connection and try again`);
+    else if (added) toast(`${added} photo${added > 1 ? "s" : ""} added`);
+  }
+
+  function photosHTML(h) {
+    const list = h.photos || [];
+    const pending = uploading[h.id] || 0;
+    const tiles = list.map((ph, i) => {
+      const src = photoCache.get(ph.id);
+      return `<button class="photo-tile" data-action="open-photo" data-i="${i}" aria-label="Open photo ${i + 1} of ${list.length}">
+        <img data-photo="${esc(ph.id)}" alt="" ${src ? `src="${src}"` : ""}></button>`;
+    }).join("") + Array.from({ length: pending }, () => `<div class="photo-tile uploading" role="status" aria-label="Uploading photo"><span class="spinner" aria-hidden="true"></span></div>`).join("");
+    return `
+      <section class="module wide photos" data-module="photos">
+        <div class="module-head"><h2>Photos</h2>
+          <div class="row" style="gap:8px">${list.length ? `<span class="muted">${list.length}</span>` : ""}
+            <label class="btn btn-sm photo-add"><span aria-hidden="true">+</span> Add photos<input type="file" id="photo-input" accept="image/*" multiple hidden></label>
+          </div>
+        </div>
+        ${list.length || pending ? `<div class="photo-grid">${tiles}</div>`
+          : `<p class="muted small">Add pictures from the day, the venue, or anything worth remembering.</p>`}
+      </section>`;
+  }
+
+  // ---------- photo viewer ----------
+
+  let viewer = null; // { hangoutId, i }
+
+  function openViewer(hangoutId, i) {
+    viewer = { hangoutId, i };
+    renderViewer();
+    const lb = $("#lightbox");
+    if (!lb.open) lb.showModal();
+  }
+  function closeViewer() {
+    viewer = null;
+    const lb = $("#lightbox");
+    if (lb.open) lb.close();
+  }
+  function stepViewer(d) {
+    const list = hangout(viewer.hangoutId)?.photos || [];
+    if (list.length < 2) return;
+    viewer.i = (viewer.i + d + list.length) % list.length;
+    renderViewer();
+  }
+  function renderViewer() {
+    const h = hangout(viewer.hangoutId);
+    const list = h?.photos || [];
+    if (!list.length) { closeViewer(); return; }
+    viewer.i = Math.max(0, Math.min(viewer.i, list.length - 1));
+    const ph = list[viewer.i];
+    const src = photoCache.get(ph.id);
+    const many = list.length > 1;
+    const lb = $("#lightbox");
+    lb.innerHTML = `
+      <div class="lb-top">
+        <span class="lb-count num">${viewer.i + 1} / ${list.length}</span>
+        <span class="lb-actions">
+          <button class="lb-btn" data-action="delete-photo">Delete</button>
+          <button class="lb-btn lb-close" data-action="close-photo" aria-label="Close photo">×</button>
+        </span>
+      </div>
+      <div class="lb-stage">
+        ${many ? `<button class="lb-nav prev" data-action="photo-prev" aria-label="Previous photo">‹</button>` : ""}
+        <img data-photo="${esc(ph.id)}" alt="Photo ${viewer.i + 1} from ${esc(h.title)}" ${src ? `src="${src}"` : ""}>
+        ${many ? `<button class="lb-nav next" data-action="photo-next" aria-label="Next photo">›</button>` : ""}
+      </div>
+      <div class="lb-foot">
+        <span>Added ${esc(new Date(ph.addedAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }))}</span>
+        <div id="lb-confirm"></div>
+      </div>`;
+    if (!src) hydratePhotos(lb);
+  }
+
+  function confirmDeletePhoto() {
+    const slot = $("#lb-confirm");
+    slot.innerHTML = `<div class="lb-confirm"><span>Delete this photo? It can't be undone.</span>
+      <span class="row"><button class="lb-btn danger" id="lb-yes">Delete photo</button><button class="lb-btn" id="lb-no">Cancel</button></span></div>`;
+    $("#lb-no").onclick = () => { slot.innerHTML = ""; };
+    $("#lb-yes").onclick = () => {
+      const h = hangout(viewer.hangoutId);
+      const ph = h.photos[viewer.i];
+      h.photos = h.photos.filter((x) => x.id !== ph.id);
+      photoStore.del(ph.id);
+      commit();
+      toast("Photo deleted");
+      if (h.photos.length) renderViewer(); else closeViewer();
+    };
+    $("#lb-yes").focus();
+  }
+
   // ---------- helpers ----------
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -308,7 +531,7 @@
       ...h.guests.map((g) => g.friendId), ...h.bring.map((b) => b.friendId), ...h.tasks.map((t) => t.friendId),
       ...h.expenses.flatMap((e) => [e.paidBy, ...e.split]), ...(h.poll?.options || []).flatMap((o) => o.votes),
     ].filter(Boolean));
-    const payload = { v: 1, hangout: h, friends: state.friends.filter((f) => ids.has(f.id)) };
+    const payload = { v: 1, hangout: { ...h, photos: [] }, friends: state.friends.filter((f) => ids.has(f.id)) };
     const bytes = new TextEncoder().encode(JSON.stringify(payload));
     let bin = "";
     bytes.forEach((b) => { bin += String.fromCharCode(b); });
@@ -334,6 +557,7 @@
     });
     const r = (id) => map[id] || id;
     const h = JSON.parse(JSON.stringify(data.hangout));
+    h.photos = [];
     const sameId = state.hangouts.findIndex((x) => x.id === h.id);
     h.guests.forEach((g) => { g.friendId = r(g.friendId); });
     h.bring.forEach((b) => { b.friendId = r(b.friendId); });
@@ -460,7 +684,7 @@
         <div class="card-foot">
           <div class="row" style="gap:10px">
             <div class="avatars">${shown.map((g) => avatar(g.friendId)).join("")}${going.length > 5 ? `<span class="avatar more">+${going.length - 5}</span>` : ""}</div>
-            <span class="muted small">${going.length} going${openTasks ? ` · ${openTasks} to-do${openTasks > 1 ? "s" : ""} left` : ""}</span>
+            <span class="muted small">${going.length} going${openTasks ? ` · ${openTasks} to-do${openTasks > 1 ? "s" : ""} left` : ""}${(h.photos || []).length ? ` · ${h.photos.length} photo${h.photos.length > 1 ? "s" : ""}` : ""}</span>
           </div>
         </div>
       </a>`;
@@ -509,6 +733,7 @@
         <div class="progress">${stats}</div>
         <div id="confirm-slot"></div>
       </section>
+      ${photosHTML(h)}
       <div class="modules">
         ${order.filter(has).map((m) => moduleHTML(m, h)).join("")}
       </div>
@@ -818,6 +1043,7 @@
   function route() {
     const dlg = $("#dialog");
     if (dlg.open) dlg.close();
+    if (viewer) closeViewer();
     const hash = location.hash || "#/";
     if (hash.startsWith("#/import/")) {
       pendingImport = decodeShare(hash.slice(9));
@@ -859,6 +1085,7 @@
     document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === nav));
     const h = m && hangout(m[1]);
     document.title = h ? `${h.title} · Hangout HQ` : nav === "friends" ? "Friends · Hangout HQ" : "Hangout HQ";
+    hydratePhotos(app);
   }
 
   const currentHangout = () => {
@@ -994,11 +1221,17 @@
       case "account": openAccountDialog(); break;
       case "sign-out": closeDialog(); signOut(); toast("Signed out"); break;
       case "reload": location.reload(); break;
+      case "open-photo": openViewer(h.id, Number(btn.dataset.i)); break;
+      case "close-photo": closeViewer(); break;
+      case "photo-prev": stepViewer(-1); break;
+      case "photo-next": stepViewer(1); break;
+      case "delete-photo": confirmDeletePhoto(); break;
       case "new-hangout": openHangoutDialog(null); break;
       case "edit-hangout": openHangoutDialog(h); break;
       case "close-dialog": closeDialog(); break;
       case "filter": filter = btn.dataset.v; render(); break;
       case "clear-examples":
+        deletePhotosOf(state.hangouts);
         state = { friends: [friend(state.meId) || { id: uid(), name: "You", color: COLORS[0] }], hangouts: [], currency: state.currency, examples: false };
         state.meId = state.friends[0].id;
         commit(); toast("Examples cleared"); break;
@@ -1039,6 +1272,7 @@
         copy.guests.forEach((g) => { g.rsvp = "pending"; });
         [...copy.tasks, ...copy.bring].forEach((t) => { t.done = false; });
         copy.expenses = [];
+        copy.photos = [];
         if (copy.poll) copy.poll.options.forEach((o) => { o.votes = []; });
         state.hangouts.push(copy);
         save(); location.hash = `#/h/${copy.id}`; toast("Copied. Pick a new date");
@@ -1046,6 +1280,7 @@
       }
       case "delete-hangout":
         confirmInline(`Delete “${h.title}”? This can't be undone.`, "Delete hangout", () => {
+          deletePhotosOf([h]);
           state.hangouts = state.hangouts.filter((x) => x.id !== h.id);
           save(); location.hash = "#/"; toast("Hangout deleted");
         });
@@ -1068,6 +1303,7 @@
       }
       case "reset-all":
         confirmInline(`Erase every hangout and friend ${cloud ? "in your account" : "in this browser"}?`, "Erase everything", () => {
+          deletePhotosOf(state.hangouts);
           if (!cloud) { try { localStorage.removeItem(STORE_KEY); } catch (_) { /* ignore */ } }
           const me = friend(state.meId);
           state = { friends: [me ? { ...me } : { id: uid(), name: "You", color: COLORS[0] }], hangouts: [], currency: state.currency, examples: false };
@@ -1153,6 +1389,9 @@
       h.budget = Math.max(0, Number(el.value) || 0); commit();
     } else if (el.dataset.field === "currency") {
       state.currency = el.value.trim() || "$"; commit();
+    } else if (el.id === "photo-input" && el.files.length && h) {
+      addPhotos(h.id, [...el.files]);
+      el.value = "";
     } else if (el.id === "import-file" && el.files[0]) {
       const reader = new FileReader();
       reader.onload = () => {
@@ -1176,6 +1415,23 @@
       clearTimeout(notesTimer);
       notesTimer = setTimeout(save, 400);
     }
+  });
+
+  const lightbox = $("#lightbox");
+  lightbox.addEventListener("close", () => { viewer = null; });
+  lightbox.addEventListener("click", (e) => { if (e.target === lightbox || e.target.classList.contains("lb-stage")) closeViewer(); });
+  document.addEventListener("keydown", (e) => {
+    if (!viewer) return;
+    if (e.key === "ArrowLeft") stepViewer(-1);
+    else if (e.key === "ArrowRight") stepViewer(1);
+  });
+  let touchX = null;
+  lightbox.addEventListener("touchstart", (e) => { touchX = e.touches.length === 1 ? e.touches[0].clientX : null; }, { passive: true });
+  lightbox.addEventListener("touchend", (e) => {
+    if (touchX === null || !viewer) return;
+    const dx = e.changedTouches[0].clientX - touchX;
+    touchX = null;
+    if (Math.abs(dx) > 50) stepViewer(dx < 0 ? 1 : -1);
   });
 
   window.addEventListener("hashchange", route);
