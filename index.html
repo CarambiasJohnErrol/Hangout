@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Figtree:wght@400;500;600;700&display=swap">
-  <link rel="stylesheet" href="styles.css?v=16">
+  <link rel="stylesheet" href="styles.css?v=17">
 </head>
 <body>
   <header class="topbar">
@@ -20,6 +20,7 @@
       <nav class="nav">
         <a href="#/" data-nav="home" class="nav-link">Hangouts</a>
         <a href="#/ideas" data-nav="ideas" class="nav-link">Ideas</a>
+        <a href="#/picks" data-nav="picks" class="nav-link">Picks</a>
         <a href="#/friends" data-nav="friends" class="nav-link">Friends</a>
         <button class="btn btn-primary btn-sm" data-action="new-hangout"><span aria-hidden="true">+</span><span>New<span class="hide-sm"> hangout</span></span></button>
         <button class="account-btn" data-action="account" aria-label="Your account" hidden></button>
@@ -38,6 +39,10 @@
       <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M15.5 8.5l-2 5-5 2 2-5z"/></svg>
       Ideas
     </a>
+    <a href="#/picks" data-nav="picks">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l2.6 5.3 5.8.8-4.2 4.1 1 5.8L12 16.8l-5.2 2.7 1-5.8-4.2-4.1 5.8-.8z"/></svg>
+      Picks
+    </a>
     <a href="#/friends" data-nav="friends">
       <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="9" cy="9" r="3.5"/><path d="M2.5 20c.6-3.6 3.2-5.5 6.5-5.5s5.9 1.9 6.5 5.5"/><circle cx="17" cy="8" r="2.8"/><path d="M17 13.5c2.5 0 4.2 1.6 4.6 4.5"/></svg>
       Friends
@@ -50,7 +55,7 @@
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
-  <script src="firebase-config.js?v=16"></script>
-  <script src="app.js?v=16"></script>
+  <script src="firebase-config.js?v=17"></script>
+  <script src="app.js?v=17"></script>
 </body>
 </html>

@@ -155,6 +155,7 @@
   function pushToCloud() {
     clearTimeout(saveTimer);
     if (!user || !state) return Promise.resolve();
+    writeList().catch(() => { /* retried on the next save */ });
     [...state.hangouts.filter((h) => h.shareId), ...joinedHangouts.filter(canEdit)]
       .forEach((h) => writeShare(h).catch(() => { /* retried on the next save */ }));
     const json = stableJSON(state);
@@ -413,6 +414,7 @@
     let changed = retireGallery(s);
     // The default currency became the Philippine peso; switch accounts that never picked one.
     if ((!s.currency || s.currency === "$") && !s.currencyChosen) { s.currency = DEFAULT_CURRENCY; changed = true; }
+    if (!Array.isArray(s.picks)) { s.picks = []; changed = true; }
     s.hangouts.forEach((h) => {
       if (!Array.isArray(h.costs)) { h.costs = []; changed = true; }
       if (!Array.isArray(h.recs)) { h.recs = []; changed = true; }
@@ -1002,11 +1004,169 @@
       toast(`${place.name} is already recommended`);
       return;
     }
-    const { osm, name, kind, cuisine, lat, lon } = place;
-    h.recs.push({ id: uid(), osm: osm || "", name, kind, cuisine: cuisine || "", lat, lon, addedBy: myName(), addedAt: Date.now(), ratings: {} });
+    const { osm, name, kind, cuisine, lat, lon, where, note } = place;
+    h.recs.push({ id: uid(), osm: osm || "", name, kind: kind || "Other", cuisine: cuisine || "", lat: lat ?? null, lon: lon ?? null,
+      where: where || "", note: note || "", addedBy: myName(), addedAt: Date.now(), ratings: {} });
     if (!h.modules.includes("recs")) h.modules.splice(Math.max(0, h.modules.indexOf("ideas")), 0, "recs");
     commit();
     toast(`Recommended ${name}. Everyone in the hangout can see and rate it`);
+  }
+
+  // ---------- my picks ----------
+  // Your own list of places and things to do (state.picks), separate from any hangout.
+  // Shared as a read-only list in Firestore at lists/<id> (state.picksListId), refreshed
+  // whenever it changes; friends with the link can save picks to their own list.
+
+  const picksView = { q: "", kind: "all", sort: "rated" };
+  const listCache = new Map();   // list id -> {status, data}
+  let listSent = "";
+
+  const samePlace = (a, b) => !!(a && b) && ((a.osm && b.osm && a.osm === b.osm) || a.name.trim().toLowerCase() === b.name.trim().toLowerCase());
+  const isPicked = (p) => (state?.picks || []).some((x) => samePlace(x, p));
+  const pickFields = ({ osm = "", name, kind = "Other", cuisine = "", where = "", note = "", lat = null, lon = null }) =>
+    ({ osm: osm || "", name, kind: REC_KINDS.includes(kind) ? kind : (kind || "Other"), cuisine: cuisine || "", where: where || "", note: note || "", lat: lat ?? null, lon: lon ?? null });
+
+  function addPick(p) {
+    state.picks = state.picks || [];
+    if (isPicked(p)) { toast(`${p.name} is already in your picks`); return false; }
+    state.picks.unshift({ id: uid(), ...pickFields(p), rating: 0, addedAt: Date.now() });
+    commit();
+    toast(`Saved ${p.name} to your picks`);
+    return true;
+  }
+
+  function sortPicks(list, sort) {
+    const by = {
+      rated: (a, b) => (b.rating || 0) - (a.rating || 0) || (b.addedAt || 0) - (a.addedAt || 0),
+      new: (a, b) => (b.addedAt || 0) - (a.addedAt || 0),
+      az: (a, b) => a.name.localeCompare(b.name),
+    }[sort] || (() => 0);
+    return [...list].sort(by);
+  }
+  const starString = (n) => (n ? "★".repeat(n) + "☆".repeat(5 - n) : "");
+
+  function picksText() {
+    const lines = sortPicks(state.picks || [], "rated").map((p) => {
+      const bits = [p.kind, p.where].filter(Boolean).join(", ");
+      return `${p.rating ? `${starString(p.rating)} ` : "• "}${p.name}${bits ? ` (${bits})` : ""}${p.note ? `: ${p.note}` : ""}`;
+    });
+    return [`${myName()}'s recommendations`, ...lines].join("\n");
+  }
+
+  function writeList() {
+    if (!cloud || !user || !state?.picksListId) return Promise.resolve();
+    const items = sortPicks(state.picks || [], "rated").map((p) => ({ ...pickFields(p), rating: p.rating || 0 }));
+    const json = stableJSON({ items, name: myName() });
+    if (json === listSent) return Promise.resolve();
+    listSent = json;
+    return db.collection("lists").doc(state.picksListId)
+      .set({ owner: user.uid, ownerName: myName(), items: JSON.parse(JSON.stringify(items)), updatedAt: FV().serverTimestamp() })
+      .catch((e) => { listSent = ""; throw e; });
+  }
+
+  async function sharePicks() {
+    if (!(state.picks || []).length) { toast("Add some picks first, then share your list"); return; }
+    if (!cloud || !user) {
+      toast((await copyText(picksText())) ? "Your list is copied. Paste it in a chat" : "Couldn't copy your list");
+      return;
+    }
+    if (!state.picksListId) { state.picksListId = newShareId(); save(); }
+    writeList().catch(() => toast("Couldn't share your list. Check your connection and try again"));
+    const url = `${location.origin}${location.pathname}#/l/${state.picksListId}`;
+    toast((await copyText(url)) ? "Link to your list copied. Friends who open it can save your picks" : "Couldn't copy the link");
+  }
+
+  function loadSharedList(id) {
+    listCache.set(id, { status: "loading" });
+    db.collection("lists").doc(id).get()
+      .then((snap) => listCache.set(id, snap.exists ? { status: "done", data: snap.data() } : { status: "missing" }))
+      .catch(() => listCache.set(id, { status: "error" }))
+      .finally(() => render());
+  }
+
+  function pickRow(p, { shared = false } = {}) {
+    const map = recMapLink(p);
+    const targets = shared ? [] : [...state.hangouts, ...joinedHangouts.filter(canEdit)].filter((h) => !isPast(h));
+    return `<li class="rec pick" data-id="${esc(p.id || "")}">
+      <span class="grow">
+        <b>${esc(p.name)}</b>
+        <span class="muted small">${shared && p.rating ? `<span class="stars-avg">${starString(p.rating)}</span> · ` : ""}${esc(p.kind || "Place")}${p.cuisine && p.cuisine !== p.kind ? ` · ${esc(p.cuisine)}` : ""}${p.where ? ` · ${esc(p.where)}` : ""}</span>
+        ${p.note ? `<span class="rec-note">“${esc(p.note)}”</span>` : ""}
+        ${shared ? "" : `<span class="rate" role="group" aria-label="Your rating for ${esc(p.name)}">
+          ${[1, 2, 3, 4, 5].map((n) => `<button class="star" data-action="rate-pick" data-v="${n}" aria-pressed="${n <= (p.rating || 0)}" aria-label="${n} star${n > 1 ? "s" : ""}">★</button>`).join("")}
+          <span class="muted small">${p.rating ? "Your rating" : "Rate it"}</span></span>`}
+      </span>
+      <span class="idea-actions">
+        ${map ? `<a class="btn btn-sm btn-ghost" href="${map}" target="_blank" rel="noopener">Map</a>` : ""}
+        ${shared ? (isPicked(p) ? `<span class="tag">Saved</span>` : `<button class="btn btn-sm btn-primary" data-action="list-save" data-i="${p._i}">Save to my picks</button>`) : `
+          ${targets.length ? `<select class="select who pick-target" data-field="pick-to-hangout" aria-label="Add ${esc(p.name)} to a hangout">
+            <option value="">Add to hangout…</option>
+            ${targets.map((h) => `<option value="${esc(h.id)}" ${(h.recs || []).some((r) => samePlace(r, p)) ? "disabled" : ""}>${esc(h.title)}</option>`).join("")}
+          </select>` : ""}
+          <button class="btn btn-sm" data-action="pick-plan">Plan here</button>
+          <button class="icon-btn" data-action="remove-pick" aria-label="Remove ${esc(p.name)}">×</button>`}
+      </span>
+    </li>`;
+  }
+
+  function renderPicks() {
+    const picks = state.picks || [];
+    const kinds = [...new Set(picks.map((p) => p.kind || "Other"))].sort();
+    if (picksView.kind !== "all" && !kinds.includes(picksView.kind)) picksView.kind = "all";
+    const q = picksView.q.trim().toLowerCase();
+    const shown = sortPicks(picks, picksView.sort)
+      .filter((p) => picksView.kind === "all" || (p.kind || "Other") === picksView.kind)
+      .filter((p) => !q || [p.name, p.kind, p.where, p.note, p.cuisine].join(" ").toLowerCase().includes(q));
+    return `
+      <div class="home-head">
+        <div><h1>My picks</h1><p class="muted">Places and things to do you'd recommend. Use them for ideas, add them to a hangout, or share your list with friends.</p></div>
+        ${picks.length ? `<div class="row picks-share">
+          <button class="btn btn-sm btn-primary" data-action="picks-share">Share my list</button>
+          <button class="btn btn-sm" data-action="picks-copy">Copy as text</button>
+        </div>` : ""}
+      </div>
+      <section class="module wide">
+        <form class="rec-form" data-form="add-pick">
+          <span class="muted small rec-form-title">Add a pick</span>
+          <div class="add-row">
+            <input class="input" name="name" maxlength="80" placeholder="A place or activity, e.g. Mama Lou's Dessert Bar" aria-label="Place or activity" required>
+            <select class="select" name="kind" aria-label="Type">${REC_KINDS.map((k) => `<option>${k}</option>`).join("")}</select>
+            <button class="btn btn-sm">Add</button>
+          </div>
+          <div class="rec-extra">
+            <input class="input" name="where" maxlength="100" placeholder="Where (optional), e.g. Maginhawa St, QC" aria-label="Where">
+            <input class="input" name="note" maxlength="140" placeholder="Why go? (optional), e.g. Best ube cheesecake" aria-label="Note">
+          </div>
+        </form>
+        ${picks.length ? `
+          <div class="toolbar">
+            <input class="input" id="picks-search" type="search" placeholder="Search your picks" value="${esc(picksView.q)}" aria-label="Search your picks">
+            <div class="chips" role="group" aria-label="Sort">${[["rated", "Top rated"], ["new", "Newest"], ["az", "A–Z"]].map(([v, l]) => `<button class="chip" data-action="picks-sort" data-v="${v}" aria-pressed="${picksView.sort === v}">${l}</button>`).join("")}</div>
+          </div>
+          ${kinds.length > 1 ? `<div class="chips ideas-cats" role="group" aria-label="Type">${["all", ...kinds].map((k) => `<button class="chip" data-action="picks-kind" data-v="${esc(k)}" aria-pressed="${picksView.kind === k}">${k === "all" ? "All" : esc(k)}</button>`).join("")}</div>` : ""}
+          ${shown.length ? `<ul class="list recs-list">${shown.map((p) => pickRow(p)).join("")}</ul>` : `<p class="muted small">No picks match.</p>`}`
+          : `<p class="muted small">No picks yet. Add a place you love above, or tap Save on anything in Ideas or a hangout's Recommendations.</p>`}
+      </section>`;
+  }
+
+  function renderSharedList(id) {
+    if (!cloud) return `<div class="empty"><b>Shared lists need accounts turned on.</b><a href="#/picks" class="btn">Go to my picks</a></div>`;
+    const entry = listCache.get(id);
+    if (!entry) { loadSharedList(id); return `<div class="loading" role="status"><span class="spinner" aria-hidden="true"></span>Loading…</div>`; }
+    if (entry.status === "loading") return `<div class="loading" role="status"><span class="spinner" aria-hidden="true"></span>Loading…</div>`;
+    if (entry.status !== "done") {
+      return `<div class="empty"><b>${entry.status === "missing" ? "That list doesn't exist anymore." : "Couldn't load that list. Check your connection and reload."}</b><a href="#/picks" class="btn">Go to my picks</a></div>`;
+    }
+    const d = entry.data;
+    const mine = d.owner === user?.uid;
+    const items = (d.items || []).map((p, i) => ({ ...p, _i: i }));
+    return `
+      <a href="#/picks" class="back">← My picks</a>
+      <div class="home-head"><div>
+        <h1>${esc(d.ownerName || "A friend")}'s recommendations</h1>
+        <p class="muted">${mine ? "This is how your list looks to friends." : `${items.length} place${items.length === 1 ? "" : "s"} and things to do, best rated first. Save any you like to your own picks.`}</p>
+      </div></div>
+      <section class="module wide">${items.length ? `<ul class="list recs-list">${items.map((p) => pickRow(p, { shared: true })).join("")}</ul>` : `<p class="muted small">This list is empty for now.</p>`}</section>`;
   }
 
   // ---------- ideas nearby ----------
@@ -1215,6 +1375,7 @@
           <span class="idea-actions">
             <a class="btn btn-sm btn-ghost" href="https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lon}" target="_blank" rel="noopener">Map</a>
             ${h && edit ? ((h.recs || []).some((r) => r.osm === p.osm) ? `<span class="tag">Recommended</span>` : `<button class="btn btn-sm btn-primary" data-action="idea-recommend" data-i="${i}">Recommend</button>`) : ""}
+            ${isPicked(p) ? `<span class="tag">Saved</span>` : `<button class="btn btn-sm" data-action="idea-save" data-i="${i}">Save</button>`}
             ${!h ? `<button class="btn btn-sm btn-primary" data-action="idea-plan" data-i="${i}">Plan here</button>` : ""}
           </span>
         </li>`).join("")}</ul>`
@@ -1609,6 +1770,11 @@
             <input class="input" name="where" maxlength="100" placeholder="Where (optional), e.g. Maginhawa St, QC" aria-label="Where">
             <input class="input" name="note" maxlength="140" placeholder="Why go? (optional), e.g. Best ube cheesecake" aria-label="Note">
           </div>
+          ${(state.picks || []).some((p) => !(h.recs || []).some((r) => samePlace(r, p))) ? `
+          <select class="select" data-field="rec-from-pick" aria-label="Add from my picks">
+            <option value="">Or add from my picks…</option>
+            ${sortPicks(state.picks, "rated").filter((p) => !(h.recs || []).some((r) => samePlace(r, p))).map((p) => `<option value="${esc(p.id)}">${p.rating ? `${starString(p.rating)} ` : ""}${esc(p.name)}</option>`).join("")}
+          </select>` : ""}
         </form>` : "";
       return moduleShell(m, h, `${form}${list.length ? `<ul class="list recs-list">${list.map(({ r, avg, count }) => {
         const mine = myRating(h, r);
@@ -1625,6 +1791,7 @@
           </span>
           <span class="idea-actions">
             ${map ? `<a class="btn btn-sm btn-ghost" href="${map}" target="_blank" rel="noopener">Map</a>` : ""}
+            ${isPicked(r) ? "" : `<button class="btn btn-sm btn-ghost" data-action="rec-save">Save</button>`}
             ${edit ? `<button class="btn btn-sm" data-action="rec-vote">+ Vote</button><button class="btn btn-sm" data-action="rec-use">Use as place</button>
             <button class="icon-btn" data-action="remove-rec" aria-label="Remove ${esc(r.name)}">×</button>` : ""}
           </span>
@@ -1697,7 +1864,8 @@
           </div>`}
           <div class="auth-head"><h1>${heading}</h1><p class="muted">${sub}</p></div>
           ${pendingImport ? `<div class="banner info small">Sign in to add <b>${esc(pendingImport.hangout.title)}</b> to your hangouts.</div>`
-            : pendingShareId ? `<div class="banner info small">You've been invited to a hangout. Sign in or create an account to join it.</div>` : ""}
+            : pendingShareId ? `<div class="banner info small">You've been invited to a hangout. Sign in or create an account to join it.</div>`
+            : (location.hash || "").startsWith("#/l/") ? `<div class="banner info small">A friend shared their recommendations with you. Sign in or create an account to see them.</div>` : ""}
           <form class="auth-form" data-form="auth" novalidate>
             ${signup ? `<label class="field"><span>Your name</span><input class="input" id="auth-name" name="name" autocomplete="name" placeholder="What friends call you" required></label>` : ""}
             <label class="field"><span>Email</span><input class="input" id="auth-email" name="email" type="email" autocomplete="email" inputmode="email" required></label>
@@ -1887,6 +2055,12 @@
       html = h ? renderHangout(h)
         : stillLoading ? `<div class="loading" role="status"><span class="spinner" aria-hidden="true"></span>Loading…</div>`
         : `<div class="empty"><b>That hangout doesn't exist anymore.</b><a href="#/" class="btn">Back to hangouts</a></div>`;
+    } else if (hash.startsWith("#/picks")) {
+      nav = "picks";
+      html = renderPicks();
+    } else if (hash.startsWith("#/l/")) {
+      nav = "picks";
+      html = renderSharedList(hash.slice(4).replace(/[^A-Za-z0-9]/g, ""));
     } else if (hash.startsWith("#/ideas")) {
       nav = "ideas";
       html = `<div class="home-head"><div><h1>Things to do</h1><p class="muted">Looking for somewhere to go? Find food, cafés, parks, karaoke, malls and more near you or anywhere.</p></div></div>
@@ -1905,10 +2079,10 @@
     }
     const focusId = document.activeElement?.id;
     app.innerHTML = html;
-    if (focusId === "search") { const s = $("#search"); s.focus(); s.setSelectionRange(s.value.length, s.value.length); }
+    if (focusId === "search" || focusId === "picks-search") { const s = $(`#${focusId}`); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } }
     document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === nav));
     const h = m && hangout(m[1]);
-    document.title = h ? `${h.title} · Hangout HQ` : nav === "friends" ? "Friends · Hangout HQ" : nav === "ideas" ? "Things to do · Hangout HQ" : "Hangout HQ";
+    document.title = h ? `${h.title} · Hangout HQ` : nav === "friends" ? "Friends · Hangout HQ" : nav === "ideas" ? "Things to do · Hangout HQ" : nav === "picks" ? "My picks · Hangout HQ" : "Hangout HQ";
     hydratePhotos(app);
   }
 
@@ -2092,7 +2266,7 @@
       case "remove-profile-pic": removeProfilePicture(); break;
       case "new-hangout": openHangoutDialog(null); break;
       case "ideas-me": case "ideas-place": case "ideas-reset": case "ideas-radius": case "ideas-cat":
-      case "ideas-more": case "ideas-retry": case "ideas-sort": case "idea-recommend": case "idea-plan": {
+      case "ideas-more": case "ideas-retry": case "ideas-sort": case "idea-recommend": case "idea-plan": case "idea-save": {
         const key = btn.closest("[data-ideas]")?.dataset.ideas;
         if (!key) break;
         const st = ideaState(key);
@@ -2106,13 +2280,15 @@
         else if (action === "ideas-retry") { st.failedQ.forEach((q) => st.loaded.delete(q)); st.failedQ.clear(); st.failed = 0; queueIdeas(key); }
         else if (action === "ideas-sort") { st.sort = btn.dataset.v; refreshIdeas(key); }
         else if (action === "idea-recommend" && place && h) recommendPlace(h, place);
+        else if (action === "idea-save" && place) { addPick(place); refreshIdeas(key); }
         else if (action === "idea-plan" && place) openHangoutDialog(null, { title: `Hangout at ${place.name}`, place: place.name });
         break;
       }
-      case "rate-rec": case "rec-vote": case "rec-use": case "remove-rec": {
+      case "rate-rec": case "rec-vote": case "rec-use": case "remove-rec": case "rec-save": {
         const rec = (h?.recs || []).find((r) => r.id === id);
         if (!rec) break;
-        if (action === "rate-rec") rateRec(h, rec, Number(btn.dataset.v));
+        if (action === "rec-save") addPick(rec);
+        else if (action === "rate-rec") rateRec(h, rec, Number(btn.dataset.v));
         else if (action === "rec-use") { h.place = rec.where ? `${rec.name}, ${rec.where}` : rec.name; commit(); toast(`Place set to ${h.place}`); }
         else if (action === "remove-rec") { h.recs = h.recs.filter((r) => r.id !== rec.id); commit(); toast(`Removed ${rec.name}`); }
         else {
@@ -2122,6 +2298,24 @@
           if (!h.modules.includes("poll")) h.modules.push("poll");
           commit(); toast(`Added ${rec.name} to the group vote`);
         }
+        break;
+      }
+      case "picks-share": sharePicks(); break;
+      case "picks-copy": toast((await copyText(picksText())) ? "Your list is copied. Paste it in a chat" : "Couldn't copy your list"); break;
+      case "picks-sort": picksView.sort = btn.dataset.v; render(); break;
+      case "picks-kind": picksView.kind = btn.dataset.v; render(); break;
+      case "rate-pick": case "remove-pick": case "pick-plan": {
+        const pick = (state.picks || []).find((p) => p.id === id);
+        if (!pick) break;
+        if (action === "rate-pick") { const n = Number(btn.dataset.v); pick.rating = pick.rating === n ? 0 : n; commit(); }
+        else if (action === "remove-pick") { state.picks = state.picks.filter((p) => p.id !== id); commit(); toast(`Removed ${pick.name}`); }
+        else openHangoutDialog(null, { title: `Hangout at ${pick.name}`, place: pick.where ? `${pick.name}, ${pick.where}` : pick.name });
+        break;
+      }
+      case "list-save": {
+        const sid = (location.hash.match(/^#\/l\/([A-Za-z0-9]+)/) || [])[1];
+        const item = listCache.get(sid)?.data?.items?.[Number(btn.dataset.i)];
+        if (item && addPick(item)) render();
         break;
       }
       case "edit-hangout": openHangoutDialog(h); break;
@@ -2274,6 +2468,15 @@
     if (!form) return;
     e.preventDefault();
     if (form.dataset.form === "auth") { submitAuth(form); return; }
+    if (form.dataset.form === "add-pick") {
+      const fd2 = new FormData(form);
+      const name = String(fd2.get("name") || "").trim();
+      if (!name) { toast("Name the place or activity"); return; }
+      if (addPick({ name, kind: fd2.get("kind"), where: String(fd2.get("where") || "").trim(), note: String(fd2.get("note") || "").trim() })) {
+        $('[data-form="add-pick"] input[name="name"]')?.focus();
+      }
+      return;
+    }
     if (form.dataset.form === "ideas-search") {
       const key = form.closest("[data-ideas]")?.dataset.ideas;
       if (key) ideasNearPlace(key, new FormData(form).get("q"));
@@ -2351,6 +2554,16 @@
       const list = el.closest("[data-module]").dataset.module;
       const it = h[list].find((x) => x.id === li.dataset.id);
       it.friendId = el.value; commit();
+    } else if (el.dataset.field === "pick-to-hangout") {
+      const pick = (state.picks || []).find((p) => p.id === el.closest("[data-id]")?.dataset.id);
+      const target = hangout(el.value);
+      if (pick && target && canEdit(target)) recommendPlace(target, pick);
+      el.value = "";
+      return;
+    } else if (el.dataset.field === "rec-from-pick" && h) {
+      const pick = (state.picks || []).find((p) => p.id === el.value);
+      if (pick) recommendPlace(h, pick);
+      return;
     } else if (el.id === "split-everyone") {
       const some = el.closest(".split-pick").querySelector(".split-some");
       if (some) some.hidden = el.checked;
@@ -2387,6 +2600,7 @@
   document.addEventListener("input", (e) => {
     const el = e.target;
     if (el.id === "search") { query = el.value; render(); return; }
+    if (el.id === "picks-search") { picksView.q = el.value; render(); return; }
     if (el.dataset.field === "notes") {
       const h = currentHangout();
       if (!h || !canEdit(h)) return;
