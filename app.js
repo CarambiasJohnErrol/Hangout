@@ -9,15 +9,16 @@
   const SIZES = [
     { id: 1, label: "Quick hang", hint: "2–5 people, barely any planning", modules: ["guests", "notes"] },
     { id: 2, label: "Get-together", hint: "5–12 people, a few things to sort", modules: ["guests", "bring", "poll", "notes"] },
-    { id: 3, label: "Party", hint: "10–30 people, tasks and costs", modules: ["guests", "bring", "tasks", "budget", "schedule", "notes"] },
-    { id: 4, label: "Big event", hint: "30+ people, trips, milestones", modules: ["guests", "tasks", "budget", "schedule", "bring", "poll", "notes"] },
+    { id: 3, label: "Party", hint: "10–30 people, tasks and costs", modules: ["guests", "bring", "tasks", "budget", "split", "schedule", "notes"] },
+    { id: 4, label: "Big event", hint: "30+ people, trips, milestones", modules: ["guests", "tasks", "budget", "split", "schedule", "bring", "poll", "notes"] },
   ];
 
   const MODULES = {
     guests: "Guests",
     bring: "Who's bringing what",
     tasks: "To-dos",
-    budget: "Costs & split",
+    budget: "Costs",
+    split: "Split the bill",
     schedule: "Schedule",
     poll: "Group vote",
     notes: "Notes",
@@ -48,7 +49,7 @@
       id: uid(), title: "Rico's 30th birthday", size: 4, date: todayISO(18), time: "18:00", endTime: "23:30",
       place: "Rooftop at Andre's building",
       description: "Surprise party. Do not tell Rico. Dress code: something gold.",
-      modules: ["guests", "tasks", "budget", "schedule", "bring", "poll", "notes"],
+      modules: ["guests", "tasks", "budget", "split", "schedule", "bring", "poll", "notes"],
       guests: [
         { friendId: you, rsvp: "going" }, { friendId: mika, rsvp: "going" }, { friendId: jo, rsvp: "going" },
         { friendId: andre, rsvp: "going" }, { friendId: bea, rsvp: "maybe" }, { friendId: sam, rsvp: "pending" },
@@ -69,6 +70,7 @@
         { id: uid(), text: "Cake", amount: 85, paidBy: mika, split: [you, mika, jo, andre] },
         { id: uid(), text: "Rooftop deposit", amount: 120, paidBy: andre, split: [you, mika, jo, andre] },
         { id: uid(), text: "Decorations", amount: 40, paidBy: you, split: [you, mika, jo, andre] },
+        { id: uid(), text: "Pizza for everyone", amount: 90, paidBy: "", split: [you, mika, jo, andre, bea] },
       ],
       budget: 400,
       schedule: [
@@ -180,7 +182,7 @@
         if (state && json === lastSynced) return; // our own save coming back
         lastSynced = json;
         state = remote;
-        if (retireGallery(state)) save();
+        if (upgradeState(state)) save();
         render();
       }, () => { loadError = "Couldn't load your hangouts. Check your connection and reload."; render(); });
     });
@@ -397,6 +399,19 @@
 
   // The earlier photo gallery is gone: its first photo becomes the hangout's cover
   // (if it has none) and the rest are deleted.
+  // Bring saved data up to date with the current version of the app.
+  function upgradeState(s) {
+    let changed = retireGallery(s);
+    s.hangouts.forEach((h) => {
+      // "Costs & split" became two sections: keep the split side wherever someone had paid.
+      if (h.modules.includes("budget") && !h.modules.includes("split") && h.expenses.some((e) => e.paidBy)) {
+        h.modules.splice(h.modules.indexOf("budget") + 1, 0, "split");
+        changed = true;
+      }
+    });
+    return changed;
+  }
+
   function retireGallery(s) {
     let changed = false;
     s.hangouts.forEach((h) => {
@@ -548,16 +563,36 @@
     if (going.length) lines.push("", `Going so far: ${going.join(", ")}`);
     const open = h.bring.filter((b) => !b.friendId);
     if (h.modules.includes("bring") && open.length) lines.push(`Still need someone to bring: ${open.map((b) => b.text).join(", ")}`);
+    if (h.modules.includes("budget") && h.expenses.length) lines.push(`Cost: about ${costPerPersonText(h)}`);
     return lines.join("\n");
   }
 
   // ---------- money ----------
 
+  // Each cost is shared evenly by the people in its `split`. `paidBy` is optional:
+  // shares count every cost, settling up counts only the ones someone has paid.
+  function shares(h) {
+    const out = {};
+    h.expenses.forEach((e) => {
+      const n = e.split.length;
+      if (!n || !e.amount) return;
+      e.split.forEach((id) => { out[id] = (out[id] || 0) + e.amount / n; });
+    });
+    return out;
+  }
+  const totalCost = (h) => h.expenses.reduce((s, e) => s + (Number(e.amount) || 0), 0);
+  function costPerPersonText(h) {
+    const vals = Object.values(shares(h));
+    if (!vals.length) return "";
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    return Math.abs(hi - lo) < 0.01 ? `${money(lo)} each` : `${money(lo)}–${money(hi)} each`;
+  }
+
   function balances(h) {
     const bal = {};
     h.expenses.forEach((e) => {
       const n = e.split.length;
-      if (!n || !e.amount) return;
+      if (!n || !e.amount || !e.paidBy) return;
       bal[e.paidBy] = (bal[e.paidBy] || 0) + e.amount;
       e.split.forEach((id) => { bal[id] = (bal[id] || 0) - e.amount / n; });
     });
@@ -683,7 +718,8 @@
     h.guests.forEach((g) => { counts[g.rsvp] = (counts[g.rsvp] || 0) + 1; });
     const tasksDone = h.tasks.filter((t) => t.done).length;
     const bringCovered = h.bring.filter((b) => b.friendId).length;
-    const spent = h.expenses.reduce((s, e) => s + (Number(e.amount) || 0), 0);
+    const spent = totalCost(h);
+    const myShare = shares(h)[state.meId] || 0;
     const n = daysUntil(h);
     const has = (m) => h.modules.includes(m);
     const missing = Object.keys(MODULES).filter((m) => !has(m));
@@ -693,10 +729,11 @@
       n !== null && n >= 0 ? `<div class="stat"><span>Countdown</span><b>${n === 0 ? "Today" : n === 1 ? "Tomorrow" : `${n} days`}</b></div>` : "",
       has("tasks") && h.tasks.length ? `<div class="stat"><span>To-dos done</span><b>${tasksDone}/${h.tasks.length}</b><div class="bar"><i style="width:${(tasksDone / h.tasks.length) * 100}%"></i></div></div>` : "",
       has("bring") && h.bring.length ? `<div class="stat"><span>Items covered</span><b>${bringCovered}/${h.bring.length}</b><div class="bar"><i style="width:${(bringCovered / h.bring.length) * 100}%"></i></div></div>` : "",
-      has("budget") && (spent || h.budget) ? `<div class="stat"><span>Spent</span><b>${money(spent)}${h.budget ? `<small> / ${money(h.budget)}</small>` : ""}</b>${h.budget ? `<div class="bar"><i style="width:${Math.min(100, (spent / h.budget) * 100)}%;${spent > h.budget ? "background:var(--bad)" : ""}"></i></div>` : ""}</div>` : "",
+      has("budget") && (spent || h.budget) ? `<div class="stat"><span>Total cost</span><b>${money(spent)}${h.budget ? `<small> / ${money(h.budget)}</small>` : ""}</b>${h.budget ? `<div class="bar"><i style="width:${Math.min(100, (spent / h.budget) * 100)}%;${spent > h.budget ? "background:var(--bad)" : ""}"></i></div>` : ""}</div>` : "",
+      has("budget") && myShare ? `<div class="stat stat-you"><span>Your share</span><b>${money(myShare)}</b></div>` : "",
     ].join("");
 
-    const order = ["guests", "tasks", "bring", "schedule", "budget", "poll", "notes"];
+    const order = ["guests", "tasks", "bring", "schedule", "budget", "split", "poll", "notes"];
     return `
       <a href="#/" class="back">← All hangouts</a>
       <section class="hero ${h.cover ? "has-cover" : ""}">
@@ -794,32 +831,59 @@
         </form>`);
     }
     if (m === "budget") {
-      const bal = balances(h);
-      const moves = settleUp(bal);
-      const spent = h.expenses.reduce((s, e) => s + e.amount, 0);
-      const splitDefault = guestIds.length ? h.guests.filter((g) => g.rsvp === "going").map((g) => g.friendId) : [];
+      const spent = totalCost(h);
+      const per = shares(h);
+      const people = Object.keys(per).sort((a, b) => per[b] - per[a] || fname(a).localeCompare(fname(b)));
+      const splitDefault = h.guests.filter((g) => g.rsvp === "going").map((g) => g.friendId);
+      const defaults = splitDefault.length ? splitDefault : guestIds;
       return moduleShell(m, h, `
         <div class="budget-grid">
           <label class="field"><span>Budget</span>
             <input class="input" type="number" min="0" step="0.01" inputmode="decimal" data-field="budget" value="${h.budget || ""}" placeholder="Optional"></label>
           <label class="field"><span>Currency</span><input class="input" data-field="currency" value="${esc(state.currency)}" maxlength="4"></label>
-          <div class="field"><span>Spent</span><b class="money spent-val">${money(spent)}</b></div>
+          <div class="field"><span>Total</span><b class="money spent-val">${money(spent)}</b></div>
         </div>
-        ${h.expenses.length ? `<ul class="list">${h.expenses.map((e) => `
-          <li data-id="${esc(e.id)}"><span class="grow"><b>${esc(e.text)}</b><br><span class="muted small">${esc(fname(e.paidBy))} paid · split ${e.split.length} way${e.split.length === 1 ? "" : "s"}</span></span>
-          <span class="money">${money(e.amount)}</span><button class="icon-btn" data-action="remove-expense" aria-label="Remove">×</button></li>`).join("")}</ul>` : `<p class="muted small">Log what people pay for and we'll work out who owes whom.</p>`}
+        ${h.expenses.length ? `<ul class="list">${h.expenses.map((e) => {
+          const n = e.split.length;
+          const who = n === 1 ? `for ${esc(fname(e.split[0]))}` : `${money(e.amount / (n || 1))} each · ${n} people`;
+          return `<li data-id="${esc(e.id)}"><span class="grow"><b>${esc(e.text)}</b><br><span class="muted small">${who}</span></span>
+          <span class="money">${money(e.amount)}</span><button class="icon-btn" data-action="remove-expense" aria-label="Remove ${esc(e.text)}">×</button></li>`;
+        }).join("")}</ul>` : `<p class="muted small">List what things cost, like the venue, food or tickets, and see what it comes to per person. Nobody has to have paid yet.</p>`}
         <form class="field" data-form="add-expense" style="gap:8px">
           <div class="add-row">
-            <input class="input" name="text" placeholder="What was it" aria-label="Expense" required>
+            <input class="input" name="text" placeholder="What is it? e.g. Venue" aria-label="Cost item" required>
             <input class="input amount" name="amount" type="number" min="0" step="0.01" inputmode="decimal" placeholder="Amount" aria-label="Amount" required>
-            ${friendSelect("paidBy", state.meId && guestIds.includes(state.meId) ? state.meId : (guestIds[0] || ""), { blank: "Paid by…" })}
+            <button class="btn btn-sm">Add cost</button>
           </div>
-          ${guestIds.length ? `<div class="split-pick" aria-label="Split between">${h.guests.map((g) => `<label><input type="checkbox" name="split" value="${esc(g.friendId)}" ${splitDefault.includes(g.friendId) ? "checked" : ""}>${esc(fname(g.friendId))}</label>`).join("")}</div>` : `<p class="muted small">Invite guests first to split costs between them.</p>`}
-          <div><button class="btn btn-sm">Add expense</button></div>
+          ${guestIds.length ? `<div class="split-pick" role="group" aria-label="Shared by"><span class="muted small">Shared by</span>${h.guests.map((g) => `<label><input type="checkbox" name="split" value="${esc(g.friendId)}" ${defaults.includes(g.friendId) ? "checked" : ""}>${esc(fname(g.friendId))}</label>`).join("")}</div>` : `<p class="muted small">Invite guests first to share costs between them.</p>`}
         </form>
+        ${people.length ? `<div class="per-person">
+          <div class="per-head"><b class="small">What each person pays</b><span class="muted small">for the whole hangout</span></div>
+          ${people.map((id) => `<div class="per-row ${id === state.meId ? "is-me" : ""}">${avatar(id)}<span class="grow">${esc(fname(id))}${id === state.meId && fname(id).toLowerCase() !== "you" ? ' <span class="muted small">(you)</span>' : ""}</span><span class="money">${money(per[id])}</span></div>`).join("")}
+        </div>` : ""}
+      `);
+    }
+    if (m === "split") {
+      const items = h.expenses;
+      const total = totalCost(h);
+      const paid = items.filter((e) => e.paidBy).reduce((s2, e) => s2 + e.amount, 0);
+      const moves = settleUp(balances(h));
+      if (!items.length) {
+        return moduleShell(m, h, `
+          <p class="muted small">After the hangout, mark who paid for each cost and we'll work out who owes whom.</p>
+          ${h.modules.includes("budget") ? `<p class="muted small">Add costs in the Costs section first.</p>` : `<div><button class="btn btn-sm" data-action="add-module" data-v="budget">Add the Costs section</button></div>`}`);
+      }
+      return moduleShell(m, h, `
+        <div class="paid-progress">
+          <div class="row" style="justify-content:space-between"><span class="small"><b class="money">${money(paid)}</b> <span class="muted">of ${money(total)} paid</span></span></div>
+          <div class="bar"><i style="width:${total ? Math.min(100, (paid / total) * 100) : 0}%"></i></div>
+        </div>
+        <ul class="list">${items.map((e) => `
+          <li data-id="${esc(e.id)}"><span class="item-body"><span class="grow"><b>${esc(e.text)}</b> <span class="money muted small">${money(e.amount)}</span></span>
+            ${friendSelect("paidby", e.paidBy, { blank: "Not paid yet" })}</span></li>`).join("")}</ul>
         ${moves.length ? `<div class="settle"><b class="small">To settle up</b>${moves.map((x) => `<div class="settle-row">${avatar(x.from)}<b>${esc(fname(x.from))}</b><span class="arrow">pays</span>${avatar(x.to)}<b>${esc(fname(x.to))}</b><span class="money" style="margin-left:auto">${money(x.amount)}</span></div>`).join("")}</div>`
-          : h.expenses.length ? `<div class="settle"><b class="small">Everyone's square.</b></div>` : ""}
-      `, { wide: false });
+          : paid ? `<div class="settle"><b class="small">Everyone's square.</b></div>` : ""}
+      `, { sub: paid < total ? `${items.filter((e) => !e.paidBy).length} not paid` : "All paid" });
     }
     if (m === "poll") {
       const p = h.poll;
@@ -1320,7 +1384,7 @@
         Object.assign(copy, { id: uid(), title: `${h.title} (again)`, date: "", createdAt: Date.now() });
         copy.guests.forEach((g) => { g.rsvp = "pending"; });
         [...copy.tasks, ...copy.bring].forEach((t) => { t.done = false; });
-        copy.expenses = [];
+        copy.expenses.forEach((e) => { e.paidBy = ""; });
         copy.cover = null;
         if (h.cover) {
           // Give the copy its own cover image so deleting one never breaks the other.
@@ -1410,13 +1474,11 @@
         commit(); $('[data-form="add-schedule"] input[name="text"]')?.focus(); break;
       case "add-expense": {
         const amount = Number(fd.get("amount"));
-        const paidBy = fd.get("paidBy");
         const split = fd.getAll("split");
-        if (!paidBy) { toast("Pick who paid"); return; }
-        if (!split.length) { toast("Pick at least one person to split with"); return; }
         if (!(amount > 0)) { toast("Enter an amount above zero"); return; }
-        h.expenses.push({ id: uid(), text: fd.get("text").trim(), amount, paidBy, split });
-        commit(); break;
+        if (!split.length) { toast("Pick at least one person to share this cost"); return; }
+        h.expenses.push({ id: uid(), text: fd.get("text").trim(), amount, paidBy: "", split });
+        commit(); $('[data-form="add-expense"] input[name="text"]')?.focus(); break;
       }
       case "new-poll": {
         const options = String(fd.get("options")).split(",").map((s) => s.trim()).filter(Boolean);
@@ -1445,6 +1507,9 @@
       const list = el.closest("[data-module]").dataset.module;
       const it = h[list].find((x) => x.id === li.dataset.id);
       it.friendId = el.value; commit();
+    } else if (el.dataset.field === "paidby" && h) {
+      const item = h.expenses.find((x) => x.id === el.closest("[data-id]").dataset.id);
+      if (item) { item.paidBy = el.value; commit(); }
     } else if (el.dataset.field === "budget" && h) {
       h.budget = Math.max(0, Number(el.value) || 0); commit();
     } else if (el.dataset.field === "currency") {
@@ -1481,7 +1546,7 @@
   });
 
   window.addEventListener("hashchange", route);
-  if (state && retireGallery(state)) save();
+  if (state && upgradeState(state)) save();
   if (cloud) startCloud();
   route();
 })();

@@ -625,3 +625,14 @@ select.who { cursor: pointer; padding-right: 4px; }
   .avatar-lg { width: 56px !important; height: 56px !important; }
   .cover-preview { width: 120px; }
 }
+
+/* ---------- Costs: per-person totals; Split the bill ---------- */
+.per-person { background: var(--surface-2); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
+.per-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; padding-bottom: 6px; }
+.per-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-top: 1px solid var(--line); min-width: 0; }
+.per-row .grow { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.per-row.is-me .grow, .per-row.is-me .money { font-weight: 700; color: var(--accent); }
+.split-pick > .muted { align-self: center; margin-right: 2px; }
+.stat-you { background: var(--accent-soft); }
+.stat-you b { color: var(--accent); }
+.paid-progress { display: flex; flex-direction: column; gap: 6px; }

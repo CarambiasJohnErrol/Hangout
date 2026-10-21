@@ -8,7 +8,9 @@ The size decides which planning tools you start with, and you can add or hide an
 - **Guests** with Going / Maybe / Can't RSVPs
 - **Who's bringing what**, with an owner for each item
 - **To-dos** with assignees and progress
-- **Costs & split**: log expenses, set a budget, and see who pays whom to settle up
+- **Costs**: list what things cost and who shares each one, with a per-person total for the
+  whole hangout. Nobody has to have paid yet
+- **Split the bill**: mark who paid for each cost and see who pays whom to settle up
 - **Schedule** for the run of the day
 - **Group vote** for picking a date, place or food
 - **Notes**
