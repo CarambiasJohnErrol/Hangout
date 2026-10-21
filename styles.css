@@ -756,3 +756,14 @@ a.btn { text-decoration: none; }
   .star { font-size: 1.5rem; padding: 3px 4px; }
 }
 @media (prefers-reduced-motion: reduce) { .star { transition: none; } }
+
+/* Your own recommendations */
+.rec-form { display: flex; flex-direction: column; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.rec-form-title { font-weight: 700; text-transform: uppercase; letter-spacing: .06em; font-size: .72rem; }
+.rec-form .add-row .select { flex: 0 1 140px; }
+.rec-extra { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.rec-note { font-size: .88rem; color: var(--ink); font-style: italic; overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .rec-extra { grid-template-columns: minmax(0, 1fr); }
+  .rec-form .add-row > .select { min-height: 44px; font-size: 16px; }
+}

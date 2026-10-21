@@ -977,6 +977,25 @@
   }
   const starsText = (avg, count) => (count ? `★ ${avg.toFixed(1)} <span class="muted">(${count})</span>` : "");
 
+  const REC_KINDS = ["Food", "Café", "Dessert", "Bar", "Park", "Beach", "Karaoke", "Cinema", "Mall", "Museum", "Activity", "Other"];
+
+  // Places from Ideas nearby have coordinates; your own picks are searched by name and "where".
+  function recMapLink(r) {
+    if (r.lat) return `https://www.google.com/maps/search/?api=1&query=${r.lat},${r.lon}`;
+    if (r.kind === "Activity" && !r.where) return "";
+    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([r.name, r.where].filter(Boolean).join(", "))}`;
+  }
+
+  function addOwnRec(h, { name, kind, where, note }) {
+    h.recs = h.recs || [];
+    if (h.recs.some((r) => r.name.toLowerCase() === name.toLowerCase())) { toast(`${name} is already recommended`); return false; }
+    h.recs.push({ id: uid(), osm: "", name, kind: REC_KINDS.includes(kind) ? kind : "Other", cuisine: "", where, note,
+      addedBy: myName(), addedAt: Date.now(), ratings: {} });
+    commit();
+    toast(`Added ${name}. Everyone in the hangout can see and rate it`);
+    return true;
+  }
+
   function recommendPlace(h, place) {
     h.recs = h.recs || [];
     if (h.recs.some((r) => (place.osm && r.osm === place.osm) || r.name.toLowerCase() === place.name.toLowerCase())) {
@@ -1578,26 +1597,41 @@
     if (m === "recs") {
       const list = sortRecs(h);
       const edit = canEdit(h);
-      return moduleShell(m, h, list.length ? `<ul class="list recs-list">${list.map(({ r, avg, count }) => {
+      const form = edit ? `
+        <form class="rec-form" data-form="add-rec">
+          <span class="muted small rec-form-title">Add your own</span>
+          <div class="add-row">
+            <input class="input" name="name" maxlength="80" placeholder="A place or activity, e.g. Board games at Jo's" aria-label="Place or activity" required>
+            <select class="select" name="kind" aria-label="Type">${REC_KINDS.map((k) => `<option>${k}</option>`).join("")}</select>
+            <button class="btn btn-sm">Add</button>
+          </div>
+          <div class="rec-extra">
+            <input class="input" name="where" maxlength="100" placeholder="Where (optional), e.g. Maginhawa St, QC" aria-label="Where">
+            <input class="input" name="note" maxlength="140" placeholder="Why go? (optional), e.g. Best ube cheesecake" aria-label="Note">
+          </div>
+        </form>` : "";
+      return moduleShell(m, h, `${form}${list.length ? `<ul class="list recs-list">${list.map(({ r, avg, count }) => {
         const mine = myRating(h, r);
+        const map = recMapLink(r);
         return `<li class="rec" data-id="${esc(r.id)}">
           <span class="grow">
             <b>${esc(r.name)}</b>
-            <span class="muted small">${count ? `<span class="stars-avg">${starsText(avg, count)}</span> · ` : ""}${esc(r.kind || "Place")}${r.cuisine && r.cuisine !== r.kind ? ` · ${esc(r.cuisine)}` : ""}${r.addedBy ? ` · added by ${esc(r.addedBy)}` : ""}</span>
+            <span class="muted small">${count ? `<span class="stars-avg">${starsText(avg, count)}</span> · ` : ""}${esc(r.kind || "Place")}${r.cuisine && r.cuisine !== r.kind ? ` · ${esc(r.cuisine)}` : ""}${r.where ? ` · ${esc(r.where)}` : ""}${r.addedBy ? ` · added by ${esc(r.addedBy)}` : ""}</span>
+            ${r.note ? `<span class="rec-note">“${esc(r.note)}”</span>` : ""}
             <span class="rate" role="group" aria-label="Your rating for ${esc(r.name)}">
               ${[1, 2, 3, 4, 5].map((n) => `<button class="star" data-action="rate-rec" data-v="${n}" aria-pressed="${n <= mine}" aria-label="${n} star${n > 1 ? "s" : ""}">★</button>`).join("")}
               <span class="muted small">${mine ? "Your rating" : "Rate it"}</span>
             </span>
           </span>
           <span class="idea-actions">
-            ${r.lat ? `<a class="btn btn-sm btn-ghost" href="https://www.google.com/maps/search/?api=1&query=${r.lat},${r.lon}" target="_blank" rel="noopener">Map</a>` : ""}
+            ${map ? `<a class="btn btn-sm btn-ghost" href="${map}" target="_blank" rel="noopener">Map</a>` : ""}
             ${edit ? `<button class="btn btn-sm" data-action="rec-vote">+ Vote</button><button class="btn btn-sm" data-action="rec-use">Use as place</button>
             <button class="icon-btn" data-action="remove-rec" aria-label="Remove ${esc(r.name)}">×</button>` : ""}
           </span>
         </li>`;
       }).join("")}</ul>`
-        : `<p class="muted small">${edit ? "No recommendations yet. Find places in Ideas nearby and tap Recommend. Everyone in the hangout can see and rate them." : "No recommendations yet. The host can add some from Ideas nearby."}</p>`,
-      { wide: true, sub: list.length ? `${list.length} place${list.length > 1 ? "s" : ""} · best rated first` : "" });
+        : `<p class="muted small">${edit ? "No recommendations yet. Add your own above, or find places in Ideas nearby and tap Recommend. Everyone in the hangout can see and rate them." : "No recommendations yet. The host can add some."}</p>`}`,
+      { wide: true, sub: list.length ? `${list.length} place${list.length > 1 ? "s" : ""}` : "" });
     }
     if (m === "ideas") {
       return moduleShell(m, h, `<div class="ideas" data-ideas="${esc(h.id)}">${ideasBody(h.id)}</div>`, { wide: true });
@@ -2079,7 +2113,7 @@
         const rec = (h?.recs || []).find((r) => r.id === id);
         if (!rec) break;
         if (action === "rate-rec") rateRec(h, rec, Number(btn.dataset.v));
-        else if (action === "rec-use") { h.place = rec.name; commit(); toast(`Place set to ${rec.name}`); }
+        else if (action === "rec-use") { h.place = rec.where ? `${rec.name}, ${rec.where}` : rec.name; commit(); toast(`Place set to ${h.place}`); }
         else if (action === "remove-rec") { h.recs = h.recs.filter((r) => r.id !== rec.id); commit(); toast(`Removed ${rec.name}`); }
         else {
           if (!h.poll) h.poll = { question: "Where should we go?", options: [] };
@@ -2274,6 +2308,13 @@
         if (!everyone && !split.length) { toast("Pick at least one person to split the bill with"); return; }
         h.expenses.push({ id: uid(), text: fd.get("text").trim(), amount, paidBy: fd.get("paidBy") || "", everyone, split });
         commit(); $('[data-form="add-expense"] input[name="text"]')?.focus(); break;
+      }
+      case "add-rec": {
+        const name = String(fd.get("name") || "").trim();
+        if (!name) { toast("Name the place or activity"); return; }
+        const ok = addOwnRec(h, { name, kind: fd.get("kind"), where: String(fd.get("where") || "").trim(), note: String(fd.get("note") || "").trim() });
+        if (ok) $('[data-form="add-rec"] input[name="name"]')?.focus();
+        break;
       }
       case "add-cost": {
         const amount = Number(fd.get("amount"));

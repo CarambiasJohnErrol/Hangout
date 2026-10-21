@@ -19,8 +19,9 @@ The size decides which planning tools you start with, and you can add or hide an
 - **Ideas nearby**: food, cafés, parks, karaoke, cinemas, museums, bars and malls near you, the
   hangout's place, or anywhere you search. Sort by nearest or by your groups' ratings, recommend
   a place to the hangout, or plan a new hangout there.
-- **Recommendations**: the places recommended for a hangout, which everyone in it can see and
-  rate 1-5 stars, best rated first. Turn one into the place or add it to the group vote. Places come from OpenStreetMap via Nominatim (free, no
+- **Recommendations**: places and activities recommended for a hangout, from Ideas nearby or
+  added by hand (name, type, where, a note). Everyone in it can see and rate them 1-5 stars,
+  best rated first. Turn one into the place or add it to the group vote. Places come from OpenStreetMap via Nominatim (free, no
   key; one request a second, per its usage policy); locations are only sent to search, never saved
 
 Share a hangout by copying a ready-to-paste invite for the group chat, or an invite link
