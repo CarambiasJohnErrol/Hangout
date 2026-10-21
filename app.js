@@ -4,6 +4,7 @@
   "use strict";
 
   const STORE_KEY = "hangout-hq-v1";
+  const DEFAULT_CURRENCY = "₱";
   const COLORS = ["#2f5bea", "#e2557a", "#1f8a5b", "#b8650a", "#7b4fd6", "#0f8a9c", "#c53c3c", "#5b6b2f"];
 
   const SIZES = [
@@ -67,15 +68,15 @@
         { id: uid(), text: "Buy decorations", friendId: you, done: false },
       ],
       expenses: [
-        { id: uid(), text: "Cake", amount: 85, paidBy: mika, split: [you, mika, jo, andre] },
-        { id: uid(), text: "Rooftop deposit", amount: 120, paidBy: andre, split: [you, mika, jo, andre] },
-        { id: uid(), text: "Decorations", amount: 40, paidBy: you, split: [you, mika, jo, andre] },
+        { id: uid(), text: "Cake", amount: 1800, paidBy: mika, split: [you, mika, jo, andre] },
+        { id: uid(), text: "Rooftop deposit", amount: 3000, paidBy: andre, split: [you, mika, jo, andre] },
+        { id: uid(), text: "Decorations", amount: 900, paidBy: you, split: [you, mika, jo, andre] },
       ],
       costs: [
-        { id: uid(), text: "Rooftop entry", amount: 15 },
-        { id: uid(), text: "Food and drinks", amount: 25 },
+        { id: uid(), text: "Rooftop entry", amount: 300 },
+        { id: uid(), text: "Food and drinks", amount: 650 },
       ],
-      budget: 400,
+      budget: 8000,
       schedule: [
         { id: uid(), time: "18:00", text: "Setup crew arrives" },
         { id: uid(), time: "18:45", text: "Guests arrive, lights off" },
@@ -100,7 +101,7 @@
       bring: [{ id: uid(), text: "Cooler", friendId: bea, done: true }], tasks: [], expenses: [], budget: 0, schedule: [],
       poll: null, notes: "", createdAt: Date.now() - 5,
     };
-    return { friends, hangouts: [bday, coffee, beach], currency: "$", examples: true, meId: you };
+    return { friends, hangouts: [bday, coffee, beach], currency: DEFAULT_CURRENCY, examples: true, meId: you };
   }
 
   // ---------- storage & accounts ----------
@@ -408,6 +409,8 @@
   // Bring saved data up to date with the current version of the app.
   function upgradeState(s) {
     let changed = retireGallery(s);
+    // The default currency became the Philippine peso; switch accounts that never picked one.
+    if ((!s.currency || s.currency === "$") && !s.currencyChosen) { s.currency = DEFAULT_CURRENCY; changed = true; }
     s.hangouts.forEach((h) => {
       if (!Array.isArray(h.costs)) { h.costs = []; changed = true; }
       // Costs became per-person amounts; the earlier shared costs now live under Split the bill.
@@ -442,7 +445,7 @@
   const initials = (name) => name.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join("") || "?";
   const money = (n) => {
     const v = Math.round(n * 100) / 100;
-    return `${v < 0 ? "−" : ""}${state.currency}${Math.abs(v).toLocaleString(undefined, { minimumFractionDigits: v % 1 ? 2 : 0, maximumFractionDigits: 2 })}`;
+    return `${v < 0 ? "−" : ""}${state.currency || DEFAULT_CURRENCY}${Math.abs(v).toLocaleString(undefined, { minimumFractionDigits: v % 1 ? 2 : 0, maximumFractionDigits: 2 })}`;
   };
 
   function avatar(id, extra = "") {
@@ -1844,7 +1847,9 @@
     } else if (el.dataset.field === "budget" && h) {
       h.budget = Math.max(0, Number(el.value) || 0); commit();
     } else if (el.dataset.field === "currency") {
-      state.currency = el.value.trim() || "$"; commit();
+      state.currency = el.value.trim() || DEFAULT_CURRENCY;
+      state.currencyChosen = true;
+      commit();
     } else if (el.dataset.upload === "cover" && el.files[0] && h) {
       setCover(h.id, el.files[0]);
       el.value = "";
