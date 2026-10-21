@@ -2,7 +2,9 @@
 
 Plan any hangout with friends, from a quick coffee to a 60-person birthday.
 
-Every hangout starts with a size: **Quick hang**, **Get-together**, **Party** or **Big event**.
+Every hangout starts with a size: **Just me** (a self date, errands or me-time), **Quick hang**,
+**Get-together**, **Party** or **Big event**. "Just me" days get Errands & to-dos, Plan for the day,
+Spending and Ideas nearby, with no guests or invite link, and a Copy plan button.
 The size decides which planning tools you start with, and you can add or hide any of them later:
 
 - **Guests** with Going / Maybe / Can't RSVPs

@@ -8,6 +8,7 @@
   const COLORS = ["#2f5bea", "#e2557a", "#1f8a5b", "#b8650a", "#7b4fd6", "#0f8a9c", "#c53c3c", "#5b6b2f"];
 
   const SIZES = [
+    { id: 0, label: "Just me", hint: "Self date, errands, me-time", modules: ["tasks", "schedule", "budget", "ideas", "notes"] },
     { id: 1, label: "Quick hang", hint: "2–5 people, barely any planning", modules: ["guests", "recs", "ideas", "notes"] },
     { id: 2, label: "Get-together", hint: "5–12 people, a few things to sort", modules: ["guests", "bring", "poll", "recs", "ideas", "notes"] },
     { id: 3, label: "Party", hint: "10–30 people, tasks and costs", modules: ["guests", "bring", "tasks", "budget", "split", "schedule", "notes"] },
@@ -503,10 +504,15 @@
     return Math.round((b - a) / 86400000);
   }
   function sizeDots(size) {
+    if (size === 0) return `<span class="size-dots solo" aria-hidden="true"><i class="on"></i></span>`;
     return `<span class="size-dots" aria-hidden="true">${[1, 2, 3, 4].map((i) => `<i class="${i <= size ? "on" : ""}"></i>`).join("")}</span>`;
   }
+  const isSolo = (h) => h?.size === 0;
+  // Section names read differently on a solo day.
+  const SOLO_TITLES = { tasks: "Errands & to-dos", schedule: "Plan for the day", budget: "Spending" };
+  const moduleTitle = (m, h) => (isSolo(h) && SOLO_TITLES[m]) || MODULES[m];
   function sizePill(size) {
-    const s = SIZES.find((x) => x.id === size) || SIZES[0];
+    const s = SIZES.find((x) => x.id === size) || SIZES.find((x) => x.id === 1);
     return `<span class="size-pill">${sizeDots(size)}${esc(s.label)}</span>`;
   }
 
@@ -814,7 +820,19 @@
     return h.id;
   }
 
+  function soloPlanText(h) {
+    const lines = [h.title, `When: ${fmtWhen(h, true)}`];
+    if (h.place) lines.push(`Where: ${h.place}`);
+    if (h.description) lines.push("", h.description);
+    const plan = [...(h.schedule || [])].sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+    if (plan.length) lines.push("", "Plan:", ...plan.map((x) => `${x.time ? fmtTime(x.time) : "—"}  ${x.text}`));
+    if (h.tasks.length) lines.push("", "Errands:", ...h.tasks.map((t) => `${t.done ? "☑" : "☐"} ${t.text}`));
+    if (perPerson(h)) lines.push("", `Spending: ${money(perPerson(h))}${h.budget ? ` of ${money(h.budget)} budget` : ""}`);
+    return lines.join("\n");
+  }
+
   function inviteText(h) {
+    if (isSolo(h) && !h.modules.includes("guests")) return soloPlanText(h);
     const going = h.guests.filter((g) => g.rsvp === "going").map((g) => fname(g.friendId));
     const lines = [`${h.title}`, `When: ${fmtWhen(h, true)}`];
     if (h.place) lines.push(`Where: ${h.place}`);
@@ -1800,7 +1818,7 @@
         <div class="card-foot">
           <div class="row" style="gap:10px">
             <div class="avatars">${shown.map((g) => avatar(g.friendId)).join("")}${going.length > 5 ? `<span class="avatar more">+${going.length - 5}</span>` : ""}</div>
-            <span class="muted small">${going.length} going${openTasks ? ` · ${openTasks} to-do${openTasks > 1 ? "s" : ""} left` : ""}${h.modules.includes("budget") && perPerson(h) ? ` · ${money(perPerson(h))} each` : ""}</span>
+            <span class="muted small">${isSolo(h) && going.length <= 1 ? "Just me" : `${going.length} going`}${openTasks ? ` · ${openTasks} ${isSolo(h) ? "errand" : "to-do"}${openTasks > 1 ? "s" : ""} left` : ""}${h.modules.includes("budget") && perPerson(h) ? ` · ${money(perPerson(h))}${isSolo(h) ? "" : " each"}` : ""}</span>
           </div>
         </div>
       </a>`;
@@ -1839,12 +1857,12 @@
     const missing = Object.keys(MODULES).filter((m) => !has(m));
 
     const stats = [
-      `<div class="stat"><span>Going</span><b>${counts.going}<small> of ${invitedCount}</small></b></div>`,
+      isSolo(h) && !has("guests") ? "" : `<div class="stat"><span>Going</span><b>${counts.going}<small> of ${invitedCount}</small></b></div>`,
       n !== null && n >= 0 ? `<div class="stat"><span>Countdown</span><b>${n === 0 ? "Today" : n === 1 ? "Tomorrow" : `${n} days`}</b></div>` : "",
-      has("tasks") && h.tasks.length ? `<div class="stat"><span>To-dos done</span><b>${tasksDone}/${h.tasks.length}</b><div class="bar"><i style="width:${(tasksDone / h.tasks.length) * 100}%"></i></div></div>` : "",
+      has("tasks") && h.tasks.length ? `<div class="stat"><span>${isSolo(h) ? "Errands done" : "To-dos done"}</span><b>${tasksDone}/${h.tasks.length}</b><div class="bar"><i style="width:${(tasksDone / h.tasks.length) * 100}%"></i></div></div>` : "",
       has("bring") && h.bring.length ? `<div class="stat"><span>Items covered</span><b>${bringCovered}/${h.bring.length}</b><div class="bar"><i style="width:${(bringCovered / h.bring.length) * 100}%"></i></div></div>` : "",
-      has("budget") && each ? `<div class="stat stat-you"><span>Per person</span><b>${money(each)}</b></div>` : "",
-      has("budget") && (group || h.budget) ? `<div class="stat"><span>Group total</span><b>${money(group)}${h.budget ? `<small> / ${money(h.budget)}</small>` : ""}</b>${h.budget ? `<div class="bar"><i style="width:${Math.min(100, (group / h.budget) * 100)}%;${group > h.budget ? "background:var(--bad)" : ""}"></i></div>` : ""}</div>` : "",
+      has("budget") && each ? `<div class="stat stat-you"><span>${isSolo(h) ? "Spending" : "Per person"}</span><b>${money(each)}${isSolo(h) && h.budget ? `<small> / ${money(h.budget)}</small>` : ""}</b></div>` : "",
+      has("budget") && !isSolo(h) && (group || h.budget) ? `<div class="stat"><span>Group total</span><b>${money(group)}${h.budget ? `<small> / ${money(h.budget)}</small>` : ""}</b>${h.budget ? `<div class="bar"><i style="width:${Math.min(100, (group / h.budget) * 100)}%;${group > h.budget ? "background:var(--bad)" : ""}"></i></div>` : ""}</div>` : "",
     ].join("");
 
     const order = ["guests", "tasks", "bring", "schedule", "budget", "split", "poll", "recs", "ideas", "notes"];
@@ -1865,8 +1883,8 @@
           </div>
           <div class="hero-actions">
             ${role !== "viewer" ? `<button class="btn btn-sm" data-action="edit-hangout">Edit</button>` : ""}
-            <button class="btn btn-sm" data-action="copy-invite">Copy invite</button>
-            <button class="btn btn-sm" data-action="share-link">${cloud ? "Invite link" : "Share link"}</button>
+            <button class="btn btn-sm" data-action="copy-invite">${isSolo(h) ? "Copy plan" : "Copy invite"}</button>
+            ${isSolo(h) && !h.modules.includes("guests") ? "" : `<button class="btn btn-sm" data-action="share-link">${cloud ? "Invite link" : "Share link"}</button>`}
             ${isJoined(h) ? "" : `<button class="btn btn-sm btn-ghost" data-action="duplicate">Duplicate</button>
             <button class="btn btn-sm btn-ghost btn-danger" data-action="delete-hangout">Delete</button>`}
           </div>
@@ -1882,7 +1900,7 @@
       <div class="modules">
         ${order.filter(has).map((m) => moduleHTML(m, h)).join("")}
       </div>
-      ${missing.length && role !== "viewer" ? `<div class="add-modules"><span class="muted small">Add a section:</span>${missing.map((m) => `<button class="chip" data-action="add-module" data-v="${m}">+ ${esc(MODULES[m])}</button>`).join("")}</div>` : ""}
+      ${missing.length && role !== "viewer" ? `<div class="add-modules"><span class="muted small">Add a section:</span>${missing.map((m) => `<button class="chip" data-action="add-module" data-v="${m}">+ ${esc(moduleTitle(m, h))}</button>`).join("")}</div>` : ""}
       </div>
     `;
   }
@@ -1927,8 +1945,8 @@
 
   function moduleShell(m, h, body, { wide = false, sub = "" } = {}) {
     return `<section class="module ${wide ? "wide" : ""}" data-module="${m}">
-      <div class="module-head"><h2>${esc(MODULES[m])}</h2>
-        <div class="row" style="gap:4px">${sub ? `<span class="muted">${sub}</span>` : ""}<button class="icon-btn" data-action="remove-module" data-v="${m}" title="Hide this section" aria-label="Hide ${esc(MODULES[m])}">×</button></div>
+      <div class="module-head"><h2>${esc(moduleTitle(m, h))}</h2>
+        <div class="row" style="gap:4px">${sub ? `<span class="muted">${sub}</span>` : ""}<button class="icon-btn" data-action="remove-module" data-v="${m}" title="Hide this section" aria-label="Hide ${esc(moduleTitle(m, h))}">×</button></div>
       </div>${body}</section>`;
   }
 
@@ -1980,12 +1998,12 @@
           <li data-id="${esc(t.id)}" class="${t.done ? "done" : ""}">
             <input type="checkbox" class="check" data-action="toggle-item" data-list="${m}" ${t.done ? "checked" : ""} aria-label="Mark done">
             <span class="item-body"><span class="grow">${esc(t.text)}</span>
-            ${friendSelect("assign", t.friendId, { blank: m === "bring" ? "Needs someone" : "Unassigned", everyone: m === "bring" })}</span>
+            ${isSolo(h) ? "" : friendSelect("assign", t.friendId, { blank: m === "bring" ? "Needs someone" : "Unassigned", everyone: m === "bring" })}</span>
             <button class="icon-btn" data-action="remove-item" data-list="${m}" aria-label="Remove">×</button>
           </li>`).join("")}</ul>` : `<p class="muted small">${m === "bring" ? "List snacks, gear or anything people should bring." : "Bookings, shopping, anything that has to get done."}</p>`}
         <form class="add-row" data-form="add-item" data-list="${m}">
           <input class="input" name="text" placeholder="${m === "bring" ? "e.g. Chips and dip" : "e.g. Reserve a table"}" aria-label="New item" required>
-          ${friendSelect("friendId", "", { blank: m === "bring" ? "Needs someone" : "Unassigned", everyone: m === "bring" })}
+          ${isSolo(h) ? "" : friendSelect("friendId", "", { blank: m === "bring" ? "Needs someone" : "Unassigned", everyone: m === "bring" })}
           <button class="btn btn-sm">Add</button>
         </form>`, { sub: items.length ? `${items.filter((t) => t.done).length}/${items.length} done` : "" });
     }
@@ -2009,21 +2027,24 @@
           <li data-id="${esc(c.id)}"><span class="grow"><b>${esc(c.text)}</b></span>
           <span class="money">${money(c.amount)}<span class="muted small"> / person</span></span>
           <button class="icon-btn" data-action="remove-cost" aria-label="Remove ${esc(c.text)}">×</button></li>`).join("")}</ul>`
-          : `<p class="muted small">Add what each person needs to pay, like a ticket, an entrance fee or their share of the food.</p>`}
+          : `<p class="muted small">${isSolo(h) ? "Add what you'll spend, like a movie ticket, lunch or a massage." : "Add what each person needs to pay, like a ticket, an entrance fee or their share of the food."}</p>`}
         <form class="add-row" data-form="add-cost">
           <input class="input" name="text" placeholder="What is it? e.g. Concert ticket" aria-label="Cost" required>
-          <input class="input amount" name="amount" type="number" min="0" step="0.01" inputmode="decimal" placeholder="Per person" aria-label="Amount per person" required>
+          <input class="input amount" name="amount" type="number" min="0" step="0.01" inputmode="decimal" placeholder="${isSolo(h) ? "Amount" : "Per person"}" aria-label="Amount" required>
           <button class="btn btn-sm">Add cost</button>
         </form>
-        <div class="each-pays">
+        ${isSolo(h) ? `<div class="each-pays">
+          <div><span class="eyebrow">Your day costs</span><b class="num">${money(each)}</b></div>
+          ${h.budget ? `<span class="muted small">${each > h.budget ? `${money(each - h.budget)} over` : `${money(h.budget - each)} left`} of your ${money(h.budget)} budget</span>` : ""}
+        </div>` : `<div class="each-pays">
           <div><span class="eyebrow">Each person pays</span><b class="num">${money(each)}</b></div>
           <span class="muted small">${people ? `× ${people} ${people === 1 ? "person" : "people"} = <b class="money">${money(each * people)}</b> for the group` : "Invite guests to see the group total"}</span>
-        </div>
-        <div class="budget-grid">
-          <label class="field"><span>Group budget</span>
+        </div>`}
+        <div class="budget-grid ${isSolo(h) ? "solo" : ""}">
+          <label class="field"><span>${isSolo(h) ? "Budget" : "Group budget"}</span>
             <input class="input" type="number" min="0" step="0.01" inputmode="decimal" data-field="budget" value="${h.budget || ""}" placeholder="Optional"></label>
           <label class="field"><span>Currency</span><input class="input" data-field="currency" value="${esc(state.currency)}" maxlength="4"></label>
-          <div class="field"><span>Group total</span><b class="money spent-val">${money(each * people)}</b></div>
+          ${isSolo(h) ? "" : `<div class="field"><span>Group total</span><b class="money spent-val">${money(each * people)}</b></div>`}
         </div>
       `, { sub: list.length ? `${money(each)} each` : "" });
     }
@@ -2454,10 +2475,10 @@
     dlg.innerHTML = `
       <form method="dialog" id="hangout-form">
         <h2>${isNew ? "Plan a hangout" : "Edit details"}</h2>
-        <label class="field"><span>What's the plan?</span><input class="input" id="f-title" name="title" required value="${esc(v.title)}" placeholder="e.g. Movie night at Jo's"></label>
+        <label class="field"><span>What's the plan?</span><input class="input" id="f-title" name="title" required value="${esc(v.title)}" placeholder="e.g. Movie night at Jo's, or a self date"></label>
         <div class="field"><span>How big is it?</span>
           <div class="size-options">${SIZES.map((s) => `
-            <label class="size-opt"><input type="radio" name="size" value="${s.id}" ${v.size === s.id ? "checked" : ""}>
+            <label class="size-opt ${s.id === 0 ? "solo" : ""}"><input type="radio" name="size" value="${s.id}" ${v.size === s.id ? "checked" : ""}>
               <b>${sizeDots(s.id)} ${esc(s.label)}</b><small>${esc(s.hint)}</small></label>`).join("")}
           </div>
           ${isNew ? `<small class="muted">This picks which planning tools you start with. You can add or hide any of them later.</small>` : ""}
@@ -2509,7 +2530,8 @@
     $("#hangout-form").addEventListener("submit", (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
-      const size = Number(fd.get("size")) || 1;
+      const sizeValue = fd.get("size");
+      const size = sizeValue === null ? 1 : Number(sizeValue); // "Just me" is 0, so no "|| 1" here
       const data = {
         title: fd.get("title").trim(), size, date: fd.get("date"), time: fd.get("time"), endTime: fd.get("endTime"),
         place: fd.get("place").trim(), description: fd.get("description").trim(),
@@ -2783,7 +2805,7 @@
       case "reset-poll": h.poll = null; commit(); break;
       case "add-module": h.modules.push(btn.dataset.v); commit(); break;
       case "remove-module": h.modules = h.modules.filter((m) => m !== btn.dataset.v); commit(); toast(`${MODULES[btn.dataset.v]} hidden. Its data is kept`); break;
-      case "copy-invite": toast((await copyText(inviteText(h))) ? "Invite copied. Paste it in your group chat" : "Couldn't copy. Try again"); break;
+      case "copy-invite": toast((await copyText(inviteText(h))) ? (isSolo(h) ? "Plan copied" : "Invite copied. Paste it in your group chat") : "Couldn't copy. Try again"); break;
       case "share-link": {
         const url = shareLink(h);
         toast((await copyText(url)) ? cloud ? "Invite link copied. Friends who open it can join this hangout" : "Link copied. Friends can open it to add this hangout" : "Couldn't copy the link");
